@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Telemax heartbeat every minute
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

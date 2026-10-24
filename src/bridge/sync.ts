@@ -1,4 +1,13 @@
 import path from 'node:path';
+import { wireNativeTools, isDurableCommand } from './nativeTools.js';
+import { ReadReceipts } from './readReceipts.js';
+import { ReactionStore } from './reactionStore.js';
+import { TelegramAlbums, isTelegramAlbum } from './telegramAlbums.js';
+import { albumFamily, sendAttachmentAlbum } from './attachmentAlbums.js';
+import { editOutgoingMedia, maxMediaSignature, replaceIncomingMedia } from './mediaEditing.js';
+import { PollWidgets, POLL_CALLBACK } from './pollWidgets.js';
+import { staticStickerWebp } from './stickers.js';
+import { ReactionSummaries } from './reactionSummaries.js';
 import { IncomingEdits, isIncomingEdit, type IncomingEdit } from './incomingEdits.js';
 import { IncomingCheckpoint, IncomingDeliveryUncertainError } from './incomingCheckpoint.js';
 import { rm, stat, writeFile } from 'node:fs/promises';
@@ -413,6 +422,10 @@ export interface MessageLink {
   textTelegramMessageIds?: number[];
   /** Confirmed incoming parts exist, but the original is not completely delivered yet. */
   partial?: boolean;
+  mediaTelegramMessageIds?: number[];
+  maxMediaSignature?: string;
+  /** Outgoing album's per-part identities; media replacement must address the right part. */
+  telegramMedia?: Array<{ telegramId: number; fileId: string; fileUniqueId?: string; attach: Record<string, unknown>; caption?: string; captionEntities?: MessageEntity[] }>;
 }
 
 /** Every MAX message a link covers: anchor first, then the further pieces. Pure + exported for unit testing. */
@@ -671,7 +684,8 @@ export async function sendAttachments(
   degradeTransient = false,
 ): Promise<number[]> {
   const ids: number[] = [];
-  for (const att of attaches) {
+  for (let index = 0; index < attaches.length; index++) {
+    const att = attaches[index]!;
     // CONTROL events with no useful rendering (`system`: a history clear; «Чат закрыт» is caught
     // earlier by handleMaxPush) must not become a "[системное событие: system]" junk message.
     if (!isRenderableAttach(att)) continue;
@@ -680,6 +694,25 @@ export async function sendAttachments(
       ids.length === 0 && replyParameters
         ? { message_thread_id: topicId, reply_parameters: replyParameters }
         : { message_thread_id: topicId };
+    const family = albumFamily(att);
+    const group: MaxAttachment[] = [];
+    if (family) for (const next of attaches.slice(index, index + 10)) {
+      if (albumFamily(next) !== family) break;
+      group.push(next);
+    }
+    if (group.length > 1) {
+      try {
+        const albumIds = await sendAttachmentAlbum(bot, groupId, topicId, group, downloadCtx, opts.reply_parameters);
+        if (albumIds) {
+          ids.push(...albumIds); sent?.push(...albumIds); index += group.length - 1;
+          if (paceMs) await sleep(paceMs);
+          continue;
+        }
+      } catch (err) {
+        if (!isPermanentTelegramRefusal(err) && !(err instanceof DownloadMissError)) throw err;
+        // A known refusal created no album: preserve each attachment through the normal fallback.
+      }
+    }
     let msg: SentMessage;
     try {
       msg = await sendOneAttachment(bot, groupId, att, downloadCtx, opts);
@@ -690,6 +723,8 @@ export async function sendAttachments(
     }
     ids.push(msg.message_id);
     sent?.push(msg.message_id);
+    const unique = (msg as { sticker?: { file_unique_id?: string } }).sticker?.file_unique_id;
+    if (att._type === 'STICKER' && att.stickerId != null && unique) downloadCtx.rememberSticker?.(unique, { _type: 'STICKER', stickerId: att.stickerId, ...(att.stickerToken ? { stickerToken: att.stickerToken } : {}) });
     // The backfill's pacing per attachment: an album is the likeliest thing to trip flood control.
     if (paceMs) await sleep(paceMs);
   }
@@ -782,6 +817,13 @@ async function sendOneAttachment(
     return withFloodRetry(() => bot.telegram.sendMessage(groupId, downloaded ? placeholderText(att, TOO_BIG_WHY) : describeAttachment(att), opts));
   }
   const source = { source: downloaded.buffer, filename: downloaded.filename };
+  if (att._type === 'STICKER' && kind === 'photo') {
+    const webp = await staticStickerWebp(downloaded.buffer);
+    if (webp) {
+      try { return await withFloodRetry(() => bot.telegram.sendSticker(groupId, { source: webp, filename: 'sticker.webp' }, opts)); }
+      catch (err) { if (!isPermanentTelegramRefusal(err)) throw err; }
+    }
+  }
   if (kind === 'photo') {
     // A safety net: MAX takes images Telegram won't show as a photo — past sendPhoto's 10 000 px
     // (width + height) or 20:1 (MAX allows 7680×7680), or in a format like TIFF. Such a picture goes
@@ -1137,6 +1179,8 @@ async function resolveAuthorPrefix(
 
 /** What ChatCatchUp needs from the bridge (server/app.ts's module state and wireBridge's helpers). */
 export interface ChatCatchUpDeps {
+  pollWidgets?: PollWidgets;
+  rememberSticker?: DownloadContext['rememberSticker'];
   bot: Telegraf;
   groupId: string;
   max: MaxClient;
@@ -1413,12 +1457,12 @@ export class ChatCatchUp {
       // A poll goes out as its text rendering, options included — sendAttachments only knows a
       // «[опрос: …]» placeholder for it.
       const pollAttach = attaches.find((a) => a._type === 'POLL');
-      if (pollAttach) {
+      if (pollAttach && !this.deps.pollWidgets) {
         const pollText = renderPollAsText(pollAttach.title, (pollAttach.answers ?? []).map((a) => a.text || '—'), pollAttach.settings ?? 0);
         text = text ? `${text}\n${pollText}` : pollText;
         attaches = attaches.filter((a) => a !== pollAttach);
       }
-      if (!text && !keyboard && !attaches.some((a) => isRenderableAttach(a))) {
+      if (!text && !keyboard && !attaches.some((a) => isRenderableAttach(a)) && !(pollAttach && this.deps.pollWidgets)) {
         await chatMapStore.advanceHistoryCursor(chatId, msg.time);
         continue;
       }
@@ -1449,12 +1493,20 @@ export class ChatCatchUp {
           if (text) {
             textIds = await sendTextPieces(bot, groupId, topicId, text, { entities: formattingInRendered(forwarded ? msg.link?.message?.text : msg.text, forwarded ? msg.link?.message?.elements : msg.elements, text), replyMarkup: joinMarkups(memberMarkup, keyboard), paceMs, sent, maxMessageId: msg.id });
           }
+          if (pollAttach && this.deps.pollWidgets) {
+            const id = await this.deps.pollWidgets.create(chatId, msg.id, topicId, pollAttach);
+            messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, telegramMessageId: id, extraTelegramMessageIds: textIds, textTelegramMessageIds: textIds, telegramTopicId: topicId });
+            this.deps.onRelayed?.({ maxChatId: String(chatId), maxMessageId: msg.id, time: Number(msg.time), text, mediaIds: [] });
+            this.strikes.clear(abortKey);
+            return;
+          }
           if (attaches.length > 0) {
             phase.value = 'attachments';
             const downloadCtx: DownloadContext = {
               max,
               ...(forwarded ? forwarded.download : { chatId, messageId: msg.id }),
               throwOnTransient: !lastTry,
+              rememberSticker: this.deps.rememberSticker,
             };
             // withFloodRetry lives INSIDE sendAttachments, around each single send (see the NOTE there).
             attachIds = await sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, paceMs, sent, lastTry);
@@ -1467,7 +1519,7 @@ export class ChatCatchUp {
           }
           const linkIds = buildLinkIds(textIds, attachIds);
           if (linkIds && msg.id != null) {
-            messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...linkIds, textTelegramMessageIds: textIds });
+            messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...linkIds, textTelegramMessageIds: textIds, mediaTelegramMessageIds: mediaIds, maxMediaSignature: maxMediaSignature(attaches) });
             this.deps.onRelayed?.({ maxChatId: String(chatId), maxMessageId: msg.id, time: Number(msg.time), text, mediaIds });
           }
           this.strikes.clear(abortKey);
@@ -1727,6 +1779,7 @@ export interface BridgeOptions {
   killEverything: () => Promise<{ endedOnMax: boolean }>;
   /** «🚪 Выйти из MAX» / /logout: ends the session on MAX too and forgets it here — topics, links and settings stay (server/maxSession.ts logout). */
   logoutMax?: () => Promise<{ endedOnMax: boolean }>;
+  closeOtherSessions?: () => Promise<void>;
   /** Puts a chat into the cached snapshot getChats() returns — a group/channel joined from the panel, before MAX sends its own update. */
   rememberChat?: (chat: unknown) => void;
   /** Cancels the in-flight history sync, waits for it to stop, and holds off new runs until the returned release is called — /reboot and /kill wrap their wipe in it so the old run can't refill the topics they delete. */
@@ -1769,6 +1822,7 @@ export function wireBridge({
   pause,
   restartBridge,
   logoutMax,
+  closeOtherSessions,
   rememberChat,
   settings,
   database,
@@ -1937,6 +1991,37 @@ export function wireBridge({
   const messageLinks = new MessageLinkStore(500, database);
   const pollLinks = new PollLinkStore(200, database);
   const incomingCheckpoint = database ? new IncomingCheckpoint(bot, database) : undefined;
+  const pollWidgets = database ? new PollWidgets(database, bot, max, targetGroupId) : undefined;
+  const rememberSticker: DownloadContext['rememberSticker'] = (unique, attach) => database?.set('maxStickers', unique, attach);
+  const reactionSummaries = database && incomingCheckpoint ? new ReactionSummaries(database, bot, targetGroupId, async record => {
+    const key = `${record.key}:reactions`;
+    const previous = database.get<{ ids: number[]; textIds: number[] }>('reactionSummaryParts', key);
+    const sent = await incomingCheckpoint.run(key, targetGroupId, previous, parts => {
+      database.set('reactionSummaryParts', key, parts);
+      for (const id of parts.ids) messageLinks.addNotice(record.chatId, record.maxMessageId, id);
+    }, () => bot.telegram.sendMessage(targetGroupId, record.text, { message_thread_id: record.topicId, disable_notification: true }));
+    database.delete('reactionSummaryParts', key);
+    return sent.message_id;
+  }) : undefined;
+  const pollTimer = setInterval(() => { if (!wiping) void pollWidgets?.flush().catch(err => logger.error('Poll widget update remains saved for retry', err)); }, 5000);
+  pollTimer.unref();
+  let summaryCursor = 0;
+  let summaryPolling = false;
+  const reactionSummaryTimer = setInterval(() => {
+    if (!max.isLoggedIn || wiping || !reactionSummaries || summaryPolling) return;
+    summaryPolling = true;
+    void (async () => {
+      await reactionSummaries.flush();
+      const active = reactionSummaries.active();
+      if (!active.length) return;
+      if (summaryCursor >= active.length) summaryCursor = 0;
+      for (const record of active.slice(summaryCursor, summaryCursor + 12)) {
+        if (!messageLinks.getByMax(record.chatId, record.maxMessageId)) { database?.delete('reactionSummaries', record.key); continue; }
+        await reactionSummaries.update(record.chatId, record.maxMessageId, record.topicId, await max.getReactions(record.chatId, record.maxMessageId));
+      }
+      summaryCursor += 12;
+    })().catch(err => logger.error('Reaction summary remains saved for retry', err)).finally(() => { summaryPolling = false; });
+  }, 60_000); reactionSummaryTimer.unref();
   async function checkpointIncoming(chatId: unknown, messageId: unknown, topicId: number, run: () => Promise<void>): Promise<void> {
     if (!incomingCheckpoint || messageId == null) return run();
     const prior = messageLinks.getByMax(chatId, messageId);
@@ -1972,16 +2057,28 @@ export function wireBridge({
     historyLimit: historyLimitFromEnv(),
     ...(database ? { checkpointIncoming } : {}),
     isPendingOutgoing: msg => String(msg.sender) === String(getMyAccountId()) && Boolean(database?.hasPendingCid(msg.cid)),
+    pollWidgets,
+    rememberSticker,
     historyDays,
     rememberChat,
   });
 
   const incomingEdits = database ? new IncomingEdits(database, bot, targetGroupId, messageLinks,
     chatId => chatMapStore.getByMaxChatId(chatId),
-    edit => broadcasts.copyEdit(edit.maxChatId, edit.maxMessageId, edit.rich.text)) : undefined;
-  interface QueuedUpdate { update: Update; operationMapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; mapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; link?: MessageLink; pollLink?: PollLink }
+    edit => broadcasts.copyEdit(edit.maxChatId, edit.maxMessageId, edit.rich.text),
+    (edit, link) => replaceIncomingMedia(bot, max, targetGroupId, edit.topicId, link, edit.attaches!, att => sendAttachments(bot, targetGroupId, edit.topicId, [att], { max, chatId: edit.maxChatId, messageId: edit.maxMessageId, throwOnTransient: true }))) : undefined;
+  const telegramAlbums = database ? new TelegramAlbums(database, targetGroupId) : undefined;
+  const readReceipts = database ? new ReadReceipts({ db: database, bot, destination: targetGroupId, ownId: getMyAccountId,
+    topic: chatId => chatMapStore.getByMaxChatId(chatId),
+    name: async userId => resolveContactDisplayName(Number(userId), await resolveProfile(max, Number(userId), 'read receipt', getContactProfiles())),
+  }) : undefined;
+  const readTimer = setInterval(() => { if (max.isLoggedIn && !wiping) void readReceipts?.flush().catch(err => logger.error('Read receipt update failed; saved for retry', err)); }, 5000);
+  readTimer.unref();
+  interface QueuedUpdate { update: Update; operationMapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; mapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; link?: MessageLink; linkFrozen?: boolean; pollLink?: PollLink }
   const deliveryQueue = database ? new DeliveryQueue(database, async (payload) => {
-    if (isIncomingEdit(payload)) {
+    if (isTelegramAlbum(payload)) {
+      await telegramAlbums!.run(payload, bot, max, messageLinks, chat => chatMapStore.getByMaxChatId(chat), rememberOutgoingSend);
+    } else if (isIncomingEdit(payload)) {
       await chatSync.runInChat(payload.maxChatId, () => incomingEdits!.run(payload));
     } else await bot.handleUpdate((payload as QueuedUpdate).update);
   }, () => {
@@ -2000,7 +2097,7 @@ export function wireBridge({
     await bot.telegram.sendMessage(targetGroupId, message, topic ? { message_thread_id: topic } : {});
   }) : undefined;
   if (database) {
-    journalMaxActions(max, database, cid => outgoingCids.remember(cid));
+    journalMaxActions(max, database, (cid, options) => { if (!options?.sendAt) outgoingCids.remember(cid); });
     journalTelegramActions(bot, database, job => isIncomingEdit(job.payload));
     max.on('message', (event: MaxMessageEvent) => {
       const p = event.payload as MaxPushPayload | null;
@@ -2018,10 +2115,11 @@ export function wireBridge({
     const message = u.message ?? u.edited_message;
     const reaction = u.message_reaction;
     const poll = u.poll_answer;
+    const pollClick = POLL_CALLBACK.test(u.callback_query?.data ?? '') ? u.callback_query : undefined;
     const actor = message?.from?.id ?? reaction?.user?.id ?? poll?.user?.id ?? u.callback_query?.from?.id;
     if (owner != null && actor !== owner) return;
-    if (message || reaction) {
-      if (String((message ?? reaction).chat?.id) !== targetGroupId) return;
+    if (message || reaction || pollClick) {
+      if (String((message ?? reaction ?? pollClick?.message).chat?.id) !== targetGroupId) return;
     }
     if (polling && privateMode) {
       const authTrigger = message?.text?.trim() === '/login' || message?.text?.trim() === '/start login' || /^maxauth:(yes|other)$/.test(u.callback_query?.data ?? '');
@@ -2033,7 +2131,7 @@ export function wireBridge({
     let mapping: Awaited<ReturnType<ChatMapStore['getByTopicId']>>;
     if (message) {
       if (!message.message_thread_id || message.forum_topic_created || message.forum_topic_edited || message.forum_topic_closed || message.forum_topic_reopened) return;
-      if (typeof message.text === 'string' && message.text.startsWith('/') && !/^\/(read|pin|unpin|delete)(?:@\w+)?(?:\s|$)/.test(message.text)) return;
+      if (typeof message.text === 'string' && message.text.startsWith('/') && !isDurableCommand(message.text)) return;
       mapping = await chatMapStore.getByTopicId(message.message_thread_id);
     } else if (reaction) {
       const link = messageLinks.getByTelegram(reaction.message_id);
@@ -2041,9 +2139,16 @@ export function wireBridge({
     } else if (poll) {
       const link = pollLinks.getByTelegramPollId(poll.poll_id);
       if (link) mapping = await chatMapStore.getByMaxChatId(link.maxChatId);
+    } else if (pollClick?.message) {
+      const link = messageLinks.getByTelegram(pollClick.message.message_id);
+      if (link) mapping = await chatMapStore.getByMaxChatId(link.maxChatId);
     }
     if (!mapping || mapping.banned) return;
-    const sourceId = u.edited_message?.message_id ?? message?.reply_to_message?.message_id ?? reaction?.message_id;
+    if (message?.media_group_id && !u.edited_message && telegramAlbums) {
+      telegramAlbums.add(update, mapping);
+      return;
+    }
+    const sourceId = u.edited_message?.message_id ?? message?.reply_to_message?.message_id ?? reaction?.message_id ?? pollClick?.message?.message_id;
     const link = sourceId != null ? messageLinks.getByTelegram(sourceId) : undefined;
     database.enqueue(`${targetGroupId}:${update.update_id}`, String(mapping.maxChatId), { update, mapping, link, ...(poll ? { pollLink: pollLinks.getByTelegramPollId(poll.poll_id) } : {}) } satisfies QueuedUpdate);
   }
@@ -2056,7 +2161,7 @@ export function wireBridge({
       const exists = database.hasJob(`${targetGroupId}:${ctx.update.update_id}`);
       // Completed updates are also deduplicated; enqueue's unique key is retained permanently.
       const msg = ctx.message as { message_thread_id?: number; text?: string } | undefined;
-      const candidate = Boolean(ctx.editedMessage || ctx.messageReaction || ctx.pollAnswer || (msg?.message_thread_id && (!msg.text?.startsWith('/') || /^\/(read|pin|unpin|delete)(?:@\w+)?(?:\s|$)/.test(msg.text))));
+      const candidate = Boolean(ctx.editedMessage || ctx.messageReaction || ctx.pollAnswer || POLL_CALLBACK.test((ctx.callbackQuery as { data?: string })?.data ?? '') || (msg?.message_thread_id && (!msg.text?.startsWith('/') || isDurableCommand(msg.text))));
       if (exists || candidate) { deliveryQueue.wake(); return; }
       return next();
     });
@@ -2119,12 +2224,12 @@ export function wireBridge({
   function operationLink(telegramId: number): MessageLink | undefined {
     const job = currentDelivery();
     const queued = job?.payload as QueuedUpdate | undefined;
-    if (queued?.link) return queued.link;
-    const link = messageLinks.getByTelegram(telegramId);
+    if (queued?.link && (queued.linkFrozen || (job && database?.effect(`${job.id}:0`)))) return queued.link;
+    const link = messageLinks.getByTelegram(telegramId) ?? queued?.link;
     // Updates can arrive in the same poll batch before their original send finishes.
     // Freeze the resolved pre-operation link before the first edit/delete side effect.
     if (job && queued && link && database) {
-      const payload = { ...queued, link: { ...link } };
+      const payload = { ...queued, link: { ...link }, linkFrozen: true };
       database.updateJobPayload(job.id, payload);
       job.payload = payload;
       return payload.link;
@@ -2138,7 +2243,7 @@ export function wireBridge({
     const mapping = queued?.mapping ? await chatMapStore.getByMaxChatId(queued.mapping.maxChatId) : await chatMapStore.getByTopicId(topic);
     if (!mapping || mapping.banned) throw new Error('Чат недоступен; операция сохранена в очереди.');
     const reply = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
-    const link = queued?.link ?? (reply && reply.message_id !== topic ? operationLink(reply.message_id) : undefined);
+    const link = reply && reply.message_id !== topic ? operationLink(reply.message_id) : undefined;
     if (link && String(link.maxChatId) !== String(mapping.maxChatId)) throw new Error('Сообщение принадлежит другому чату MAX.');
     return { mapping, link };
   }
@@ -2163,6 +2268,15 @@ export function wireBridge({
     await max.pinMessage(target.mapping.maxChatId, null, false);
     await ctx.reply('Закрепление в MAX снято.', { message_thread_id: target.mapping.telegramTopicId });
   });
+
+  wireNativeTools({ bot, max, db: database, links: messageLinks, chats: chatMapStore, target: operationTarget, closeOtherSessions,
+    ownProfile: async () => (await max.getContactInfo([getMyAccountId()]))[0],
+    renderSent: async (chatId, messageId) => {
+      const message = (await max.getMessages(chatId, [messageId]))[0];
+      if (!message) throw new Error('Не удалось прочитать подтверждённое исходящее сообщение MAX.');
+      await chatSync.runInChat(chatId, () => handleMaxPush({ chatId, message } as MaxPushPayload, true));
+    } });
+  bot.action(POLL_CALLBACK, async ctx => { if (!pollWidgets) throw new Error('Постоянная база опросов недоступна.'); await pollWidgets.click(ctx, ctx.match[1]!, ctx.match[2]!); });
 
   // «📜 Сколько истории перенести?» — one question at a time; a second caller waits for its answer.
   // Due when no depth was ever chosen, or after a wipe (/reboot, /kill) — the caller also checks
@@ -2239,7 +2353,7 @@ export function wireBridge({
   // `${chatId}:${messageId}` -> what we last relayed, so the sticky lastReactedMessageId/lastReaction
   // fields on CHAT_UPDATE (repeated across unrelated pushes) don't re-trigger the same Telegram call.
   // Doubles as the poll list for reaction removal; keeps the original messageId (BigInt) for MSG_GET_REACTIONS.
-  const lastRelayedReaction = new Map<string, { chatId: unknown; messageId: unknown; emoji: string }>();
+  const lastRelayedReaction = new ReactionStore(database);
   // `${chatId}:${messageId}|${emoji}` pairs Telegram rejected as outside its reaction set. FIFO-bounded.
   const rejectedReactions = new Set<string>();
   const REJECTED_REACTIONS_CAP = 200;
@@ -2248,6 +2362,7 @@ export function wireBridge({
   function forgetLink(maxChatId: unknown, maxMessageId: unknown): void {
     messageLinks.remove(maxChatId, maxMessageId);
     lastRelayedReaction.delete(`${String(maxChatId)}:${String(maxMessageId)}`);
+    database?.delete('reactionSummaries', `${String(maxChatId)}:${String(maxMessageId)}`);
   }
 
   /**
@@ -2269,6 +2384,7 @@ export function wireBridge({
     for (const key of [...lastRelayedReaction.keys()]) {
       if (key.startsWith(prefix)) lastRelayedReaction.delete(key);
     }
+    for (const summary of reactionSummaries?.active() ?? []) if (summary.chatId === String(maxChatId)) database?.delete('reactionSummaries', summary.key);
     if (dropped > 0) logger.info(`Forgot ${dropped} message link(s) of MAX chat ${String(maxChatId)} — its topic is going away`);
   }
 
@@ -2277,6 +2393,7 @@ export function wireBridge({
     messageLinks.clear();
     pollLinks.clear();
     database?.clearKind('incomingEditVersions');
+    database?.clearKind('reactionSummaries');
     lastRelayedReaction.clear();
   }
 
@@ -2497,6 +2614,8 @@ export function wireBridge({
       // silently vanished (confirmed live 2026-08-13 on a forwarded FILE that never arrived).
       const payload = event.payload as MaxPushPayload;
       if (payload?.chatId != null) chatSync.runInChat(payload.chatId, () => handleMaxPush(payload)).catch((err) => logger.error('handleMaxPush crashed', err));
+    } else if (event.opcode === OPCODES.PUSH_READ_MARK) {
+      readReceipts?.accept(event.payload);
     } else if (event.opcode === OPCODES.PUSH_TYPING) {
       void handleMaxTyping(event.payload as MaxTypingPayload);
     } else if (event.opcode === OPCODES.CHAT_UPDATE) {
@@ -2543,6 +2662,12 @@ export function wireBridge({
 
     const link = messageLinks.getByMax(chat.id, chat.lastReactedMessageId);
     if (!link) return;
+    const reactionTopic = await chatMapStore.getByMaxChatId(chat.id);
+    if (reactionTopic && !reactionTopic.banned && reactionSummaries) {
+      reactionSummaries.watch(chat.id, chat.lastReactedMessageId, reactionTopic.telegramTopicId);
+      try { await reactionSummaries.update(chat.id, chat.lastReactedMessageId, reactionTopic.telegramTopicId, await max.getReactions(chat.id, chat.lastReactedMessageId)); }
+      catch (err) { logger.error('Reaction counters saved for later refresh', err); }
+    }
 
     const key = `${chat.id}:${String(chat.lastReactedMessageId)}`;
     if (lastRelayedReaction.get(key)?.emoji === chat.lastReaction) return;
@@ -2779,7 +2904,7 @@ export function wireBridge({
     }
   }
 
-  async function handleMaxPush(payload: MaxPushPayload): Promise<void> {
+  async function handleMaxPush(payload: MaxPushPayload, forceOwn = false): Promise<void> {
     const chatId = payload?.chatId;
     const message = payload?.message;
     if (chatId == null || !message) return;
@@ -2788,7 +2913,7 @@ export function wireBridge({
     // Our own message echoed back. Only a NEW message is an echo: a deletion in the MAX app of a
     // message sent from Telegram is a REMOVED repeat push with the same cid, and must go through.
     // An EDITED repeat stays dropped — that copy is the owner's own Telegram message.
-    if (message.cid != null && (outgoingCids.has(message.cid) || (String(message.sender) === String(getMyAccountId()) && database?.hasPendingCid(message.cid))) && message.status !== 'REMOVED') return;
+    if (!forceOwn && message.cid != null && (outgoingCids.has(message.cid) || (String(message.sender) === String(getMyAccountId()) && database?.hasPendingCid(message.cid))) && message.status !== 'REMOVED') return;
     // Banned chat (/ban): drop everything for it — no mirror, no topic recreate.
     const banCheck = await chatMapStore.getByMaxChatId(chatId);
     if (banCheck?.banned) return;
@@ -2887,8 +3012,9 @@ export function wireBridge({
       // A new message already in Telegram: the catch-up above relayed it moments ago — including a
       // poll, whose own push would otherwise post a tally of zero votes.
       const hasVotes = attaches.some((a) => (a as MaxAttachment)._type === 'POLL' && (a as MaxAttachment).state?.result?.some((r) => (r.voteCount ?? 0) > 0));
-      if (message.status == null && !hasVotes) return;
-      if (text != null && !isPollUpdate) {
+      if (message.status == null && !hasVotes && !isPollUpdate) return;
+      const mediaChanged = message.status === 'EDITED' && Array.isArray(message.attaches) && existingLink.maxMediaSignature !== maxMediaSignature(attaches);
+      if ((text != null || mediaChanged) && !isPollUpdate) {
         // Telegram never shows its "edited" tag on bot-edited messages, so the marker goes into the
         // text itself, fused with the author prefix in groups ("✏️ 👤 Имя:"). No stacking on
         // repeated edits: MAX sends the full fresh text each time.
@@ -2897,10 +3023,10 @@ export function wireBridge({
         // Receipt time ≈ edit time (MAX's payload carries no confirmed edit timestamp). Timezone
         // mirrors the client's default, overridable via TZ — the container runs on UTC.
         const editedAt = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: process.env.TZ || 'Europe/Moscow' }).format(new Date());
-        let marked = editAuthorPrefix ? `✏️ (${editedAt}) ${editAuthorPrefix}${text}` : `✏️ изменено в ${editedAt}:\n${text}`;
+        let marked = editAuthorPrefix ? `✏️ (${editedAt}) ${editAuthorPrefix}${text ?? ''}` : `✏️ изменено в ${editedAt}:\n${text ?? ''}`;
         const richEntities = formattingInRendered(forwarded ? message.link?.message?.text : message.text, forwarded ? message.link?.message?.elements : message.elements, marked);
         if (incomingEdits && deliveryQueue) {
-          incomingEdits.enqueue({ maxChatId: String(chatId), maxMessageId: message.id, topicId, rich: { text: marked, entities: richEntities }, keyboard }, { text, elements: forwarded ? message.link?.message?.elements : message.elements, keyboard });
+          incomingEdits.enqueue({ maxChatId: String(chatId), maxMessageId: message.id, topicId, rich: { text: marked, entities: richEntities }, keyboard, ...(mediaChanged ? { attaches: attaches.filter(a => ['PHOTO', 'VIDEO', 'FILE', 'AUDIO', 'STICKER', 'LOCATION', 'CONTACT'].includes((a as MaxAttachment)._type ?? '')) as MaxAttachment[] } : {}) }, { text, elements: forwarded ? message.link?.message?.elements : message.elements, keyboard, ...(mediaChanged ? { attaches } : {}) });
           deliveryQueue.wake();
         } else {
         // The edit carries the message's current keyboard; an empty one removes buttons MAX dropped.
@@ -2916,6 +3042,7 @@ export function wireBridge({
       }
       const updatedPoll = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
       if (updatedPoll) {
+        if (pollWidgets && await pollWidgets.update(chatId, message.id, updatedPoll)) return;
         const key = `${String(chatId)}:${String(message.id)}`;
         const version = typeof updatedPoll.version === 'number' ? updatedPoll.version : undefined;
         if (version == null || lastRelayedPollVersion.get(key) !== version) {
@@ -2972,6 +3099,15 @@ export function wireBridge({
     if (orphanEdit) text = `✏️ Изменено (исходное сообщение не найдено):\n${text ?? ''}`;
 
     const pollAttach = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
+    if (pollAttach && pollWidgets) {
+      await sendToTopic(chatId, topicId, async id => checkpointIncoming(chatId, message.id, id, async () => {
+        const headers = text ? await sendTextPieces(bot, targetGroupId, id, text, { replyParameters }) : [];
+        const widget = await pollWidgets.create(chatId, message.id, id, pollAttach);
+        messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId: widget, extraTelegramMessageIds: headers, textTelegramMessageIds: headers, telegramTopicId: id });
+        await chatSync.advanceCursor(chatId, message.time, 'incoming MAX poll widget');
+      }));
+      return;
+    }
     if (pollAttach) {
       try {
         await sendToTopic(chatId, topicId, async (topicId) => checkpointIncoming(chatId, message.id, topicId, async () => {
@@ -3079,7 +3215,7 @@ export function wireBridge({
             // Always CALL sendAttachments, never behind a `??=` on the text id: a forward always
             // produces text, and a short-circuit there silently dropped every forwarded attachment
             // (root-caused live 2026-08-13).
-            const downloadCtx: DownloadContext = { max, ...(forwarded ? forwarded.download : { chatId, messageId: message.id }) };
+            const downloadCtx: DownloadContext = { max, ...(forwarded ? forwarded.download : { chatId, messageId: message.id }), rememberSticker };
             // The reply goes on the text when there is one; only a media-only reply threads it into the first attachment.
             attachIds = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, textIds.length > 0 ? undefined : replyParameters, undefined, sent);
           }
@@ -3091,7 +3227,7 @@ export function wireBridge({
           }
           const linkIds = buildLinkIds(textIds, attachIds);
           if (linkIds) {
-            messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds, textTelegramMessageIds: textIds });
+            messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds, textTelegramMessageIds: textIds, mediaTelegramMessageIds: mediaIds, maxMediaSignature: maxMediaSignature(attaches), ...(forceOwn ? { outgoing: true, telegramTopicId: topicId } : {}) });
             // An orphan edit is no new message — the broadcast has nothing to put it under.
             if (!orphanEdit) broadcasts.copyIncoming({ maxChatId: String(chatId), maxMessageId: message.id, time: Number(message.time), text, mediaIds, quote: broadcastQuote });
             lastInAt = Date.now();
@@ -3173,6 +3309,8 @@ export function wireBridge({
   function buildHelpText(): string {
     const phone = getActivePhone();
     return `🌉 Мост MAX${phone ? ` (${maskPhone(phone)})` : ''} ↔ Telegram
+
+/tools — тихая и отложенная отправка, нативная пересылка, устройства, папки, профиль и реакции MAX.
 
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
@@ -3777,6 +3915,17 @@ export function wireBridge({
     return `🗳️ «${pollAttach.title ?? ''}»\n${lines.join('\n')}`;
   }
 
+  async function createPollControls(chatId: unknown, messageId: unknown, topicId: number, poll: MaxAttachment): Promise<void> {
+    if (!pollWidgets || !database || !incomingCheckpoint) return;
+    const key = `${String(chatId)}:${String(messageId)}:poll-controls`;
+    const previous = database.get<{ ids: number[]; textIds: number[] }>('pollControlParts', key);
+    await incomingCheckpoint.run(key, targetGroupId, previous, parts => {
+      database.set('pollControlParts', key, parts);
+      for (const id of parts.ids) messageLinks.addNotice(chatId, messageId, id);
+    }, () => pollWidgets.create(chatId, messageId, topicId, poll));
+    database.delete('pollControlParts', key);
+  }
+
   /**
    * Re-fetches a poll's message from CHAT_HISTORY and posts its current tally as a reply (joined
    * to the poll's link as a notice). Throws if the poll/mapping can't be found.
@@ -3785,7 +3934,7 @@ export function wireBridge({
     const mapping = await chatMapStore.getByMaxChatId(maxChatId);
     if (!mapping) throw new Error(`No Telegram topic mapped for MAX chat ${String(maxChatId)}`);
     // Paged back (up to 1000 messages): a poll replayed by a backfill is often far older than the newest batch.
-    let msg: MaxHistoryMessage | undefined;
+    let msg: MaxHistoryMessage | undefined = (await max.getMessages(maxChatId, [maxMessageId]))[0];
     let from = historyStartTime();
     for (let i = 0; i < 10 && !msg; i++) {
       const batch = await max.getChatHistory(maxChatId, from, HISTORY_BATCH_SIZE);
@@ -3798,6 +3947,10 @@ export function wireBridge({
       | MaxAttachment
       | undefined;
     if (!pollAttach) throw new Error(`Poll message ${String(maxMessageId)} not found in chat ${String(maxChatId)} history`);
+    if (pollWidgets) {
+      if (!await pollWidgets.update(maxChatId, maxMessageId, pollAttach)) await createPollControls(maxChatId, maxMessageId, mapping.telegramTopicId, pollAttach);
+      return;
+    }
     const text = await formatPollResultsText(pollAttach);
     const sent = await bot.telegram.sendMessage(targetGroupId, text, {
       message_thread_id: mapping.telegramTopicId,
@@ -4408,7 +4561,7 @@ export function wireBridge({
       }
 
       if (poll) {
-        const settings = (poll.is_anonymous ? 1 : 0) | (poll.allows_multiple_answers ? 2 : 0);
+        const settings = (poll.is_anonymous ? 1 : 0) | (poll.allows_multiple_answers ? 2 : 0) | 4; // Telegram polls permit changing/removing a vote.
         const pollAttach = {
           _type: 'POLL',
           title: poll.question,
@@ -4421,6 +4574,12 @@ export function wireBridge({
         // round trip would find no link and post it again.
         messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
         copyToBroadcasts(messageId, time);
+        if (pollWidgets) {
+          const sentPoll = (await max.getMessages(mapping.maxChatId, [messageId]))[0]?.attaches?.find(a => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
+          if (!sentPoll) throw new Error('MAX принял сообщение, но пока не вернул созданный опрос; задание сохранено.');
+          await createPollControls(mapping.maxChatId, messageId, topicId, sentPoll);
+          return;
+        }
         // Votes cast on THIS Telegram poll can't reach MAX: a bot gets poll_answer only for polls
         // it sent itself (and never for anonymous ones) — say so instead of letting counts drift.
         const hint = await bot.telegram
@@ -4481,6 +4640,9 @@ export function wireBridge({
         // No MAX audio-track attach is known — the file pipeline delivers it as a playable file.
         attach = await uploadTelegramAttachmentToMax(bot, max, audio.file_id, 'document', audio.file_name ?? 'audio.mp3');
       } else if (sticker) {
+        const original = database?.get<Record<string, unknown>>('maxStickers', (sticker as { file_unique_id?: string }).file_unique_id ?? '');
+        if (original) attach = original;
+        else {
         // No MAX-side sticker-upload opcode. Static webp goes through the PHOTO pipeline (confirmed
         // live 2026-08-13), video stickers (webm) through VIDEO_UPLOAD, animated (tgs/Lottie) are
         // rendered to a WebM first (lottie.ts) — MAX's own animated stickers arrive as VIDEO attaches.
@@ -4495,6 +4657,7 @@ export function wireBridge({
           }
         } else {
           attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'photo');
+        }
         }
       }
       if (!attach) {
@@ -4515,7 +4678,9 @@ export function wireBridge({
 
       const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink, { elements: telegramToMax(caption, captionEntities) });
       rememberOutgoingSend(mapping.maxChatId, cid, time);
-      messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+      const sourceFile = (ctx.message as unknown as { photo?: Array<{ file_id: string; file_unique_id?: string }>; video?: { file_id: string; file_unique_id?: string }; document?: { file_id: string; file_unique_id?: string } }).photo?.at(-1) ?? video ?? document ?? animation ?? videoNote ?? voice ?? audio ?? sticker;
+      messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true,
+        ...(sourceFile ? { telegramMedia: [{ telegramId: ctx.message.message_id, fileId: sourceFile.file_id, fileUniqueId: (sourceFile as { file_unique_id?: string }).file_unique_id, attach, caption, captionEntities }] } : {}) });
       copyToBroadcasts(messageId, time);
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
@@ -4539,9 +4704,10 @@ export function wireBridge({
     if (!mapping) return;
     const link = operationLink(ctx.editedMessage.message_id);
     if (!link || !link.outgoing || String(link.maxChatId) !== String(mapping.maxChatId)) return;
-    const newText = (ctx.editedMessage as { text?: string; caption?: string }).text ?? (ctx.editedMessage as { caption?: string }).caption;
-    if (newText == null) return;
     try {
+      if (await editOutgoingMedia(bot, max, database, link, ctx.editedMessage, l => messageLinks.add(l))) return;
+      const newText = (ctx.editedMessage as { text?: string; caption?: string }).text ?? (ctx.editedMessage as { caption?: string }).caption;
+      if (newText == null) return;
       const m = ctx.editedMessage as { entities?: MessageEntity[]; caption_entities?: MessageEntity[]; text?: string };
       await editOutgoingText(max, link, { text: newText, entities: (m.text != null ? m.entities : m.caption_entities) ?? [] }, l => messageLinks.add(l));
     } catch (err) {

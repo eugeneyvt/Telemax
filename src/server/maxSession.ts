@@ -49,6 +49,7 @@ export interface SessionClient {
   verifyCode(authToken: string, code: string): Promise<VerifyCodeResult>;
   checkPassword(trackId: string, password: string): Promise<string>;
   logout(): Promise<void>;
+  closeOtherSessions?(): Promise<string>;
 }
 
 export interface MaxSessionDeps {
@@ -128,6 +129,18 @@ export class MaxSessionController {
 
   get lastKnownPhone(): string {
     return this.lastKnownPhone_;
+  }
+
+  /** A successful SESSIONS_CLOSE rotates the current token; never leave only the old token on disk. */
+  async closeOtherSessions(): Promise<void> {
+    const current = this.session;
+    if (!current || this.state_ !== 'loggedIn' || !this.deps.client.closeOtherSessions) throw new Error('Сначала требуется действующая сессия MAX.');
+    const token = await this.deps.client.closeOtherSessions();
+    if (this.session !== current) throw new Error('Сессия изменилась во время операции; требуется проверка входа.');
+    const updated = { ...current, sessionToken: token, savedAt: new Date().toISOString() };
+    // Keep the valid token in memory even if the disk save fails, so a reconnect can recover.
+    this.session = updated;
+    await this.deps.store.save(updated);
   }
 
   /** Epoch ms the panel pause ends at (Number.POSITIVE_INFINITY = until resumed); null when not paused. */

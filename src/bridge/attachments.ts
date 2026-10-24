@@ -27,6 +27,7 @@ export interface MaxAttachment {
   url?: string;
   lottieUrl?: string;
   stickerId?: unknown;
+  stickerToken?: string;
   fileId?: unknown; // arrives as BigInt (msgpack int64) — pass through as-is, never coerce to Number
   name?: string;
   size?: number;
@@ -49,6 +50,7 @@ export interface MaxAttachment {
       answerId?: unknown;
       voteCount?: number;
       rate?: number;
+      options?: number;
       votes?: Array<{ userId?: unknown; timestamp?: unknown }>;
     }>;
     voterPreviewIds?: unknown[];
@@ -103,6 +105,7 @@ export function videoDimensions(att: { width?: unknown; height?: unknown }): { w
 }
 
 export interface DownloadContext {
+  rememberSticker?: (fileUniqueId: string, sticker: MaxAttachment) => void;
   max: MaxClient;
   chatId: unknown;
   messageId: unknown;

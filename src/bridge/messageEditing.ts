@@ -14,7 +14,13 @@ export async function editOutgoingText(max: MaxClient, original: MessageLink, ri
   for (let i = 0; i < pieces.length; i++) {
     const part = pieces[i]!;
     const elements = telegramToMax(part.text, part.entities);
-    if (i < old.length) await max.editMessage(original.maxChatId, old[i], part.text, elements);
+    if (i < old.length) {
+      // MAX treats attachments:[] as removal, including a caption-only edit. Retain every
+      // known media part on the first message; additional caption messages remain text-only.
+      const media = i === 0 ? original.telegramMedia?.map(p => p.attach) : undefined;
+      if (media?.length) await max.editMessage(original.maxChatId, old[i], part.text, elements, media);
+      else await max.editMessage(original.maxChatId, old[i], part.text, elements);
+    }
     else {
       const sent = await max.sendMessage(original.maxChatId, part.text, [], undefined, { elements });
       if (sent.messageId == null) throw new Error('MAX не вернул id дополнительной части правки.');

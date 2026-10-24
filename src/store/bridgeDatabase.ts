@@ -156,6 +156,10 @@ export class BridgeDatabase {
     this.transaction(() => this.db.exec("UPDATE effects SET status='uncertain' WHERE status='running'; UPDATE jobs SET status='retry',next_at=0 WHERE status='running';"));
   }
   pending(limit = 30): DeliveryJob[] { return this.db.prepare("SELECT * FROM jobs WHERE status!='done' ORDER BY id LIMIT ?").all(limit).map(r => this.parseJob(r)); }
+  health(): { pending: number; failed: number; uncertain: number; oldestAt: number | null } {
+    const row = this.db.prepare("SELECT COUNT(*) AS pending,SUM(status='failed') AS failed,SUM(status='uncertain') AS uncertain,MIN(created) AS oldest FROM jobs WHERE status!='done'").get()!;
+    return { pending: Number(row.pending), failed: Number(row.failed ?? 0), uncertain: Number(row.uncertain ?? 0), oldestAt: row.oldest == null ? null : Number(row.oldest) };
+  }
   next(now = Date.now()): DeliveryJob | undefined {
     const r = this.db.prepare(`SELECT j.* FROM jobs j WHERE j.status IN ('pending','retry','uncertain') AND j.next_at<=? AND NOT EXISTS(SELECT 1 FROM jobs p WHERE p.chat=j.chat AND p.id<j.id AND p.status!='done') ORDER BY j.id LIMIT 1`).get(now);
     return r ? this.parseJob(r) : undefined;
@@ -180,7 +184,7 @@ export class BridgeDatabase {
       return found;
     }
     return this.transaction(() => {
-      const cid = needsCid ? this.nextCid() : undefined;
+      const cid = needsCid ? this.nextCid() * (method === 'forwardMessage' ? -1 : 1) : undefined;
       this.db.prepare("INSERT INTO effects(key,job_id,method,args,status,cid,created) VALUES(?,?,?,?,'prepared',?,?)").run(key, jobId, method, encodePersistent(args), cid ?? null, Date.now());
       return this.effect(key)!;
     });

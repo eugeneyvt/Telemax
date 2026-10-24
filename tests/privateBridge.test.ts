@@ -72,6 +72,19 @@ async function harness(pending = false) {
   return { bot, max: spies, calls, auth, inbox, message, processQueue, maxEdit };
 }
 describe('private topics and real update routing', () => {
+  it('applies queued caption edits to separate album parts without reverting an earlier edit', async () => {
+    const h = await harness();
+    new MessageLinkStore(5, db).add({ maxChatId: '55', maxMessageId: 900n, telegramMessageId: 20, extraTelegramMessageIds: [21], telegramTopicId: 7, outgoing: true, telegramMedia: [
+      { telegramId: 20, fileId: 'a', attach: { _type: 'PHOTO', photoToken: 'a' }, caption: 'old A' },
+      { telegramId: 21, fileId: 'b', attach: { _type: 'PHOTO', photoToken: 'b' }, caption: 'old B' },
+    ] });
+    const first = h.message('', { photo: [{ file_id: 'a' }], caption: 'new A' });
+    const second = h.message('', { message_id: 21, photo: [{ file_id: 'b' }], caption: 'new B' });
+    await h.bot.handleUpdate({ update_id: first.update_id, edited_message: first.message });
+    await h.bot.handleUpdate({ update_id: second.update_id, edited_message: second.message });
+    await h.processQueue();
+    expect(h.max.editMessage.mock.calls.map(args => (args as unknown[])[2])).toEqual(['new A\nold B', 'new A\nnew B']);
+  });
   it('opens only the explicitly verified Saved Messages chat without sending to MAX', async () => {
     const h = await harness(); h.max.chatsInfo.mockResolvedValue([{ id: 0, status: 'ACTIVE' }]);
     await h.bot.handleUpdate(h.message('/saved', {}, 42, undefined));

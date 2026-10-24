@@ -40,6 +40,10 @@ const SECRET_KEYS = new Set([
   'photoToken',
   'code',
   'apiKey',
+  'HEALTH_TOKEN',
+  'healthToken',
+  'telegramToken',
+  'stickerToken',
   // CHECK_PASSWORD's request payload — without these the MAX account password
   // went to the packet log in plain text.
   'password',

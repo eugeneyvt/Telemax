@@ -1,0 +1,16 @@
+[Unit]
+Description=Check Telemax from an independent server
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 /srv/telemax-observer/observer.py --config /srv/telemax-observer/config.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/telemax-observer
+TimeoutStartSec=50

@@ -42,6 +42,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY entrypoint.sh ./
+COPY scripts/healthcheck.mjs ./healthcheck.mjs
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 CMD ["node", "/app/healthcheck.mjs"]
 # Baked in from the host's git checkout at build time (docker-compose.yml passes it through from
 # $GIT_COMMIT) — the runtime image has no .git of its own (excluded via .dockerignore), so this is
 # the only way /version can know what commit is actually running vs what's latest upstream.

@@ -50,7 +50,7 @@ export function uploadReadyTimeoutMs(bytes: number): number {
   return Math.min(5 * 60_000, 60_000 + Math.ceil(Math.max(0, bytes) / 1_048_576) * 3000);
 }
 
-async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
+export async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
   // getFileLink is a Bot API call — it already goes through Telegraf's (possibly
   // proxied) client. Only the download of the returned api.telegram.org/file/… URL
   // bypasses Telegraf, so it's the one spot that needs the proxy applied by hand.
@@ -105,8 +105,8 @@ function contentDispositionFor(filename: string): string {
   return `attachment; filename=${encodeURIComponent(clean)}`;
 }
 
-async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type: 'PHOTO'; photoToken: string }> {
-  const { url } = await max.requestPhotoUpload();
+export async function uploadPhotoToMax(max: MaxClient, buffer: Buffer, profile = false): Promise<{ _type: 'PHOTO'; photoToken: string }> {
+  const { url } = await max.requestPhotoUpload(profile);
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: 'image/jpeg' }), 'photo.jpg');
   const res = await postToMax(url, {

@@ -71,7 +71,7 @@ export class SessionStore {
     const run = this.writeQueue.then(async () => {
       await mkdir(path.dirname(this.filePath), { recursive: true });
       const tmpPath = `${this.filePath}.tmp`;
-      await writeFile(tmpPath, JSON.stringify(encoded), 'utf8');
+      await writeFile(tmpPath, JSON.stringify(encoded), { encoding: 'utf8', mode: 0o600 });
       await rename(tmpPath, this.filePath);
     });
     // Keep the queue moving even if this write failed, so one bad write can't wedge every later one.

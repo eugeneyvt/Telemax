@@ -24,6 +24,7 @@ import { MaxSessionController } from './maxSession.js';
 import { getTelegramProxyAgent, initTelegramProxy } from '../telegram/proxy.js';
 import { assertSupportedRuntime } from './runtime.js';
 import { installGroupDiscovery } from '../telegram/groupDiscovery.js';
+import { writeBridgeHealth, serveBridgeHealth, type HealthInput } from './health.js';
 
 assertSupportedRuntime();
 
@@ -69,6 +70,8 @@ let chatSync: ChatCatchUp | null = null;
 let askHistoryDepth: (() => Promise<number>) | null = null;
 let historyQuestionDue: (() => boolean) | null = null;
 let tgActive = false;
+const startedAt = Date.now();
+let lastTelegramPollAt: number | null = null;
 // LOGIN's embedded chat list is capped at chatsCount (<=50) and, live, has also
 // been observed to just omit chats a later resumed-session LOGIN included —
 // cachedChats gets replaced with the real, fully-paginated CHATS_LIST result
@@ -419,6 +422,7 @@ async function startServer(): Promise<void> {
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
         logoutMax,
+        closeOtherSessions: () => maxSession.closeOtherSessions(),
         rememberChat: (chat) => upsertCachedChat(chat),
         settings: settingsStore,
         suspendChatSync,
@@ -451,6 +455,21 @@ async function startServer(): Promise<void> {
   // No inbound server: the bridge is headless (v0.4). Auth, status and control all live in
   // the Telegram bot now (see /login, the /panel menu). MAX runs over an outbound TCP socket
   // and Telegram over long-polling, so nothing needs to listen on a port.
+  let healthWriting = false;
+  const healthInput = (): HealthInput => ({ startedAt, maxState: maxSession.state, telegramEnabled: config.telegramEnabled, telegramActive: tgActive, lastTelegramPollAt, paused: maxSession.state === 'paused',
+    queue: database?.health(), incomingUncertain: database?.values<{ created?: number }>('incomingPending').filter(p => typeof p.created === 'number' && Date.now() - p.created > 180_000).length ?? 0 });
+  const healthServer = process.env.HEALTH_PORT ? serveBridgeHealth(healthInput, process.env.HEALTH_TOKEN ?? '', Number(process.env.HEALTH_PORT)) : undefined;
+  healthServer?.on('error', () => { logger.error('Health endpoint could not listen'); process.exitCode = 1; });
+  const healthTick = async () => {
+    if (healthWriting) return;
+    healthWriting = true;
+    try {
+      await writeBridgeHealth(path.join(process.cwd(), '.data', 'health.json'), healthInput());
+    } catch (err) { logger.error('Could not write health status', err); }
+    finally { healthWriting = false; }
+  };
+  await healthTick();
+  const healthTimer = setInterval(() => void healthTick(), 10_000); healthTimer.unref();
 
   // docker stop / systemd send SIGTERM (node runs as PID 1 — exec-form CMD, so it actually
   // receives it). Stop polling Telegram and close the MAX socket cleanly instead of letting the
@@ -459,6 +478,7 @@ async function startServer(): Promise<void> {
   // socket stops that backfill before the cursor passes it (TransientDownloadError).
   const shutdown = (signal: string): void => {
     logger.info(`Received ${signal}, shutting down`);
+    healthServer?.close(); clearInterval(healthTimer);
     try {
       bot?.stop(signal);
     } catch {
@@ -499,7 +519,7 @@ function buildBotDescription(): string {
 Удаление: свайпом своего, реакцией 👎 на своё или /delete ответом (/delete me — только у себя).
 
 Ограничения:
-• Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
+• Голосование MAX — кнопками карточки, результаты — из MAX. Просмотр темы не отмечает MAX прочитанным: /read.
 
 Команды:`;
   let text = head;
@@ -516,6 +536,17 @@ const BOT_COMMANDS = [
   { command: 'panel', description: '🎛 Пульт управления (меню с кнопками)' },
   { command: 'saved', description: '⭐ Открыть Избранное MAX' },
   { command: 'help', description: 'Полный список команд и ограничений' },
+  { command: 'tools', description: 'Отложенная отправка, пересылка, профиль и папки MAX' },
+  { command: 'silent', description: 'Тихая отправка в MAX: /silent текст' },
+  { command: 'schedule', description: 'Отправить позже: /schedule +30m текст' },
+  { command: 'scheduled', description: 'Запланированные через мост сообщения этой темы' },
+  { command: 'unschedule', description: 'Отменить отложенное: /unschedule номер' },
+  { command: 'forward', description: 'Переслать оригинал MAX: ответ /forward номер_темы' },
+  { command: 'devices', description: 'Устройства MAX и завершение других сессий' },
+  { command: 'folders', description: 'Папки MAX' },
+  { command: 'profile', description: 'Посмотреть или изменить профиль MAX' },
+  { command: 'avatar', description: 'Поставить фото профиля MAX: ответом на фото' },
+  { command: 'reactions', description: 'Все счётчики реакций MAX: ответом на сообщение' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
   { command: 'login', description: 'Войти в MAX (номер + SMS, в личке бота)' },
   { command: 'logout', description: 'Выйти из MAX — темы и настройки останутся' },
@@ -638,7 +669,7 @@ function watchPolling(bot_: Telegraf): void {
     const longPoll = method === 'getUpdates' && Number((payload as { timeout?: unknown } | null)?.timeout) > 0;
     if (!longPoll) return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra);
     pollInFlightSince = Date.now();
-    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra).finally(() => {
+    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra).then(result => { lastTelegramPollAt = Date.now(); return result; }).finally(() => {
       pollInFlightSince = null;
     });
   }) as typeof bot_.telegram.callApi;

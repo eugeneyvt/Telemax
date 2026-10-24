@@ -6,6 +6,7 @@ import type { MessageLink } from './sync.js';
 import type { RichText } from './formatting.js';
 import { currentDelivery, outsideDelivery } from './deliveryQueue.js';
 import { editIncomingText } from './messageEditing.js';
+import type { MaxAttachment } from './attachments.js';
 
 export interface IncomingEdit {
   kind: 'incoming-edit';
@@ -15,6 +16,7 @@ export interface IncomingEdit {
   rich: RichText;
   keyboard?: InlineKeyboardMarkup;
   original?: MessageLink;
+  attaches?: MaxAttachment[];
 }
 export function isIncomingEdit(value: unknown): value is IncomingEdit {
   return (value as Partial<IncomingEdit> | null)?.kind === 'incoming-edit';
@@ -33,6 +35,7 @@ export class IncomingEdits {
     private readonly links: EditLinks,
     private readonly resolveTopic: (maxChatId: string) => Promise<{ telegramTopicId: number; banned?: boolean } | undefined>,
     private readonly applied: (edit: IncomingEdit) => void = () => {},
+    private readonly replaceMedia?: (edit: IncomingEdit, link: MessageLink) => Promise<MessageLink>,
   ) {}
   enqueue(edit: Omit<IncomingEdit, 'kind' | 'original'>, source: unknown): DeliveryJob {
     const key = `${edit.maxChatId}:${String(edit.maxMessageId)}`;
@@ -63,7 +66,11 @@ export class IncomingEdits {
       job.payload = edit;
     }
     await editIncomingText(this.bot, this.chatId, mapping.telegramTopicId, original, edit.rich, link => this.links.add(link));
-    const updated = this.links.getByMax(edit.maxChatId, edit.maxMessageId)!;
+    let updated = this.links.getByMax(edit.maxChatId, edit.maxMessageId)!;
+    if (edit.attaches && this.replaceMedia) {
+      updated = await this.replaceMedia(edit, updated);
+      this.links.add(updated);
+    }
     const markupMessage = updated.textTelegramMessageIds?.at(-1) ?? updated.telegramMessageId;
     if (!updated.outgoing || updated.textTelegramMessageIds?.length) {
       await this.bot.telegram.editMessageReplyMarkup(this.chatId, markupMessage, undefined, edit.keyboard ?? { inline_keyboard: [] });

@@ -194,7 +194,9 @@ export class MaxRequestOutcomeUnknownError extends MaxConnectionLostError {
     this.name = 'MaxRequestOutcomeUnknownError';
   }
 }
-export interface MaxSendOptions { cid?: number; elements?: MaxTextElement[] }
+export interface MaxSendOptions { cid?: number; elements?: MaxTextElement[]; notify?: boolean; sendAt?: number }
+export interface MaxFolder { id: string; title: string; include: unknown[]; filters?: unknown[]; options?: unknown[] }
+export interface MaxDeviceSession { id?: unknown; deviceName?: string; current?: boolean; [key: string]: unknown }
 
 /**
  * True when an EVENTS push says the upload with this id is processed: `{videoId}` for video,
@@ -658,7 +660,7 @@ export class MaxClient extends EventEmitter {
           this.emit('disconnected');
           if (!this.closedByUser && this.opts.reconnect) this.scheduleReconnect();
         }
-        if (sent && [OPCODES.MSG_SEND, OPCODES.MSG_EDIT, OPCODES.MSG_DELETE, OPCODES.MSG_REACTION, OPCODES.MSG_CANCEL_REACTION, OPCODES.SEND_VOTE, OPCODES.CHAT_SET_INFO, OPCODES.CHAT_MARK].includes(opcode as never)) {
+        if (sent && [OPCODES.MSG_SEND, OPCODES.MSG_EDIT, OPCODES.MSG_DELETE, OPCODES.MSG_REACTION, OPCODES.MSG_CANCEL_REACTION, OPCODES.SEND_VOTE, OPCODES.CHAT_SET_INFO, OPCODES.CHAT_MARK, OPCODES.PROFILE, OPCODES.SESSIONS_CLOSE, OPCODES.FOLDERS_UPDATE, OPCODES.FOLDERS_DELETE].includes(opcode as never)) {
           throw new MaxRequestOutcomeUnknownError(opcode, error);
         }
         throw error;
@@ -757,13 +759,14 @@ export class MaxClient extends EventEmitter {
     options: MaxSendOptions = {},
   ): Promise<{ cid: number; messageId: unknown; attaches: unknown[]; time: unknown }> {
     const cid = options.cid ?? this.nextCid();
+    if (options.sendAt != null && (!Number.isSafeInteger(options.sendAt) || options.sendAt <= Date.now())) throw new Error('Время отложенной отправки должно быть в будущем.');
     // The OUTGOING reply link is {type, messageId, chatId}; the INCOMING one carries `message`
     // instead (two shapes, confirmed 2026-08-16). messageId is the quoted message's BigInt id.
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       chatId: toChatId(chatId),
-      message: { text, cid: BigInt(cid), elements: options.elements ?? [], attaches, link },
-      notify: true,
+      message: { text, cid: BigInt(cid), elements: options.elements ?? [], attaches, link, ...(options.sendAt == null ? {} : { delayedAttributes: { timeToFire: BigInt(options.sendAt), notifySender: options.notify ?? true } }) },
+      notify: options.notify ?? true,
     });
     const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null)?.message;
     if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MSG_SEND failed'), OPCODES.MSG_SEND);
@@ -790,7 +793,7 @@ export class MaxClient extends EventEmitter {
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       userId: toUserId(userId),
       message: { text, cid: BigInt(cid), elements: options.elements ?? [], attaches, link },
-      notify: true,
+      notify: options.notify ?? true,
     });
     if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'Open-dialog send failed'), OPCODES.MSG_SEND);
     const p = payload as { chatId?: unknown; message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null;
@@ -805,8 +808,8 @@ export class MaxClient extends EventEmitter {
   }
 
   /** `messageId` must be the genuine MAX integer id (BigInt) — see opcodes.ts for the type pitfall across these three calls. */
-  async editMessage(chatId: unknown, messageId: unknown, text: string, elements: MaxTextElement[] = []): Promise<void> {
-    const { dir, payload } = await this.request(OPCODES.MSG_EDIT, { chatId: toChatId(chatId), messageId, text, elements, attachments: [] });
+  async editMessage(chatId: unknown, messageId: unknown, text: string | null, elements: MaxTextElement[] = [], attachments: unknown[] = []): Promise<void> {
+    const { dir, payload } = await this.request(OPCODES.MSG_EDIT, { chatId: toChatId(chatId), messageId, text, elements, attachments });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_EDIT failed'));
   }
 
@@ -814,6 +817,60 @@ export class MaxClient extends EventEmitter {
     const { dir, payload } = await this.request(OPCODES.MSG_GET, { chatId: toChatId(chatId), messageIds: messageIds.map(id => BigInt(String(id))) });
     if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MSG_GET failed'), OPCODES.MSG_GET);
     return (payload as { messages?: MaxHistoryMessage[] } | null)?.messages ?? [];
+  }
+
+  /** Native forward references the MAX original; it does not re-upload a Telegram copy. */
+  async forwardMessage(chatId: unknown, sourceChatId: unknown, sourceMessageId: unknown, _unused?: undefined, options: MaxSendOptions = {}): Promise<{ cid: number; messageId: unknown; attaches: unknown[]; time: unknown }> {
+    const cid = options.cid ?? -this.nextCid();
+    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
+      chatId: toChatId(chatId), message: { cid: BigInt(cid), link: { type: 'FORWARD', messageId: BigInt(String(sourceMessageId)), chatId: toChatId(sourceChatId) }, attaches: [] }, notify: options.notify ?? true,
+    });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX forward failed'), OPCODES.MSG_SEND, (payload as { error?: string })?.error);
+    const message = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } })?.message;
+    if (message?.id == null) throw new MaxRequestOutcomeUnknownError(OPCODES.MSG_SEND);
+    return { cid, messageId: message.id, attaches: message.attaches ?? [], time: message.time };
+  }
+
+  async getDeviceSessions(): Promise<MaxDeviceSession[]> {
+    const { dir, payload } = await this.request(OPCODES.SESSIONS_INFO, {});
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX sessions failed'), OPCODES.SESSIONS_INFO);
+    const sessions = (payload as { sessions?: MaxDeviceSession[] })?.sessions;
+    if (!Array.isArray(sessions)) throw new Error('MAX вернул неизвестный формат списка устройств.');
+    return sessions;
+  }
+
+  /** The caller MUST persist this rotated token before reconnecting or reporting success. */
+  async closeOtherSessions(): Promise<string> {
+    const { dir, payload } = await this.request(OPCODES.SESSIONS_CLOSE, {});
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX close sessions failed'), OPCODES.SESSIONS_CLOSE);
+    const token = (payload as { token?: unknown })?.token;
+    if (typeof token !== 'string' || token.length < 100) throw new Error('MAX не вернул новый токен после завершения сессий.');
+    return token;
+  }
+
+  async getFolders(): Promise<MaxFolder[]> {
+    const { dir, payload } = await this.request(OPCODES.FOLDERS_GET, { folderSync: 0 });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX folders failed'), OPCODES.FOLDERS_GET);
+    const folders = (payload as { folders?: MaxFolder[] })?.folders;
+    if (!Array.isArray(folders)) throw new Error('MAX вернул неизвестный формат папок.');
+    return folders;
+  }
+
+  async saveFolder(folder: MaxFolder): Promise<void> {
+    if (!folder.id || !folder.title.trim()) throw new Error('У папки должны быть id и название.');
+    const { dir, payload } = await this.request(OPCODES.FOLDERS_UPDATE, { id: folder.id, title: folder.title, include: folder.include.map(toChatId), filters: folder.filters ?? [], options: folder.options ?? [] });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX update folder failed'), OPCODES.FOLDERS_UPDATE);
+  }
+
+  async deleteFolder(id: string): Promise<void> {
+    const { dir, payload } = await this.request(OPCODES.FOLDERS_DELETE, { folderIds: [id] });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX delete folder failed'), OPCODES.FOLDERS_DELETE);
+  }
+
+  async changeProfile(profile: { firstName: string; lastName: string; description: string; photoToken?: string }): Promise<void> {
+    if (!profile.firstName.trim()) throw new Error('Имя профиля не должно быть пустым.');
+    const { dir, payload } = await this.request(OPCODES.PROFILE, { ...profile, avatarType: 'USER_AVATAR' });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MAX profile failed'), OPCODES.PROFILE);
   }
 
   async markRead(chatId: unknown, messageId: unknown): Promise<void> {
@@ -1061,16 +1118,20 @@ export class MaxClient extends EventEmitter {
     if (dir === DIR.ERR) throw new Error(describeAuthError(answer, 'MSG_CALLBACK failed'));
   }
 
-  async deleteMessages(chatId: unknown, messageIds: unknown[], forMe: boolean): Promise<void> {
-    const { dir, payload } = await this.request(OPCODES.MSG_DELETE, { chatId: toChatId(chatId), messageIds, forMe });
+  async deleteMessages(chatId: unknown, messageIds: unknown[], forMe: boolean, itemType?: 'DELAYED'): Promise<void> {
+    const { dir, payload } = await this.request(OPCODES.MSG_DELETE, { chatId: toChatId(chatId), messageIds, forMe, ...(itemType ? { itemType } : {}) });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_DELETE failed'));
+    if (itemType === 'DELAYED') {
+      const confirmed = (payload as { messageIds?: unknown[] })?.messageIds;
+      if (!Array.isArray(confirmed) || messageIds.some(id => !confirmed.some(got => String(got) === String(id)))) throw new Error('MAX не подтвердил отмену всех отложенных сообщений.');
+    }
   }
 
   /**
    * One page of chat history, newest-first from `from` (ms timestamp, exclusive upper bound).
    * Message objects match PUSH_MESSAGE's shape exactly (reverse-engineered 2026-08-08).
    */
-  async getChatHistory(chatId: unknown, from: number, backward = 100): Promise<MaxHistoryMessage[]> {
+  async getChatHistory(chatId: unknown, from: number, backward = 100, itemType: 'REGULAR' | 'DELAYED' = 'REGULAR'): Promise<MaxHistoryMessage[]> {
     const { dir, payload } = await this.request(OPCODES.CHAT_HISTORY, {
       chatId: toChatId(chatId),
       // A ms timestamp (~1.7e12) — same overflow trap as cid/messageId/chatId (see toChatId).
@@ -1082,7 +1143,7 @@ export class MaxClient extends EventEmitter {
       getChat: false,
       getMessages: true,
       interactive: false,
-      itemType: 'REGULAR',
+      itemType,
     });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_HISTORY failed'));
     const messages = (payload as { messages?: MaxHistoryMessage[] } | null)?.messages;
@@ -1090,8 +1151,8 @@ export class MaxClient extends EventEmitter {
   }
 
   /** Requests an upload slot for a single photo. Response shape supplied by the user, not in max-protocol-full.md. */
-  async requestPhotoUpload(): Promise<{ url: string; photoIds: unknown[] }> {
-    const { dir, payload } = await this.request(OPCODES.PHOTO_UPLOAD, { count: 1 });
+  async requestPhotoUpload(profile = false): Promise<{ url: string; photoIds: unknown[] }> {
+    const { dir, payload } = await this.request(OPCODES.PHOTO_UPLOAD, { count: 1, ...(profile ? { profile: true } : {}) });
     const result = payload as { url?: string; photoIds?: unknown[] } | null;
     if (dir === DIR.ERR || !result?.url) {
       throw new Error(describeAuthError(payload, 'PHOTO_UPLOAD did not return an upload url'));

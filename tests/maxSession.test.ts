@@ -29,6 +29,7 @@ class FakeClient extends EventEmitter {
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
   logout = vi.fn(async () => {});
+  closeOtherSessions = vi.fn(async () => 'rotated-fixture-token');
 }
 
 function setup(session: MaxSession | null = SESSION) {
@@ -65,6 +66,16 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('MaxSessionController — resume retries', () => {
+  it('persists a rotated token after closing other sessions and uses it on reconnect', async () => {
+    const { ctl, client, store } = setup();
+    client.login.mockResolvedValue({ sessionToken: 'resumed-token', payload: {} });
+    client.emit('ready'); await settle();
+    await ctl.closeOtherSessions();
+    expect(store.save).toHaveBeenLastCalledWith(expect.objectContaining({ sessionToken: 'rotated-fixture-token' }));
+    client.emit('disconnected'); client.emit('ready'); await settle();
+    expect(client.login).toHaveBeenLastCalledWith('rotated-fixture-token');
+    ctl.shutdown();
+  });
   it('a transient LOGIN failure reconnects with backoff and never wipes the session', async () => {
     const { ctl, client, store } = setup();
     expect(client.connect).toHaveBeenCalledTimes(1);

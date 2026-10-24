@@ -8,6 +8,12 @@ export const OPCODES = {
   START_AUTH: 0x0011,
   CHECK_CODE: 0x0012,
   LOGIN: 0x0013,
+  PROFILE: 0x0010,
+  SESSIONS_INFO: 0x0060,
+  SESSIONS_CLOSE: 0x0061,
+  FOLDERS_GET: 0x0110,
+  FOLDERS_UPDATE: 0x0112,
+  FOLDERS_DELETE: 0x0114,
   // Read from MAX's web client 2026-10-13 (its «Выйти»: `send(20, {pushToken})`, pushToken = its
   // web-push subscription). Ends the session on MAX's side — it leaves «Настройки → Устройства».
   LOGOUT: 0x0014,
@@ -114,7 +120,6 @@ export const OPCODES = {
   // isn't "rediscovered" later), and every entry here also names its opcode in the
   // packet logs (formatOpcode) — the PUSH_* ones do arrive live and show up there by
   // name. Move an entry back up once the bridge sends or handles it.
-  PROFILE: 0x0010,
   // Contact search — supplied by the user 2026-08-16. Search by name/nick ({query, count})
   // and lookup by phone ({phone} — field is `phone`, not phoneNumber; `+` optional).
   CONTACT_SEARCH: 0x0025,
@@ -124,8 +129,9 @@ export const OPCODES = {
   // Bot API gives bots no way to detect a human typing, so there's nothing on the
   // Telegram side that could ever trigger sending this to MAX. Kept for reference.
   MSG_TYPING: 0x0065,
-  // `{chatId, message: {cid, link: {type: 'FORWARD', messageId, chatId}, attaches: []}, notify}`
-  // — supplied by the user 2026-08-10. `link.messageId` is a decimal STRING, not the usual int.
+  // Historical, unused guess. Real native forwards use MSG_SEND (0x40), not this opcode.
+  // MAX web's link schema requires messageId/chatId int64; the PyMax string-id variant
+  // was rejected with proto.payload on the real TCP endpoint during acceptance.
   FORWARD: 0x0046,
   MSG_GET: 0x0047,
   // User-confirmed 2026-08-13 from their own reverse-engineering (real MAX client

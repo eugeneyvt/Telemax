@@ -21,19 +21,20 @@ export function journalTelegramActions(bot: Telegraf, store: BridgeDatabase, app
   const original = bot.telegram.callApi.bind(bot.telegram);
   bot.telegram.callApi = (async (method: string, payload: unknown, extra?: unknown) => {
     const active = context.getStore();
-    if (!active || !applies(active.job) || !['sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'deleteMessage'].includes(method)) {
+    if (!active || !applies(active.job) || !['sendMessage', 'sendPhoto', 'sendVideo', 'sendVideoNote', 'sendVoice', 'sendAudio', 'sendDocument', 'sendSticker', 'sendMediaGroup', 'editMessageMedia', 'editMessageCaption', 'editMessageText', 'editMessageReplyMarkup', 'deleteMessage'].includes(method)) {
       return (original as Function)(method, payload, extra);
     }
     const effect = store.prepareEffect(active.job.id, active.effectIndex++, `telegram.${method}`, [payload], false);
     if (effect.status === 'done') return effect.result;
-    const createsMessage = method === 'sendMessage';
+    const createsMessage = method.startsWith('send');
     if (createsMessage && effect.status === 'uncertain') throw new UncertainDeliveryError('Telegram');
     store.markEffect(effect.key, 'running');
     let received = false;
     try {
       const result = await (original as Function)(method, effect.args[0], extra);
       received = true;
-      if (createsMessage && (!Number.isSafeInteger(result?.message_id) || result.message_id <= 0)) throw new UncertainDeliveryError('Telegram');
+      const parts = Array.isArray(result) ? result : [result];
+      if (createsMessage && (!parts.length || parts.some(part => !Number.isSafeInteger(part?.message_id) || part.message_id <= 0))) throw new UncertainDeliveryError('Telegram');
       store.markEffect(effect.key, 'done', result);
       return result;
     } catch (error) {
@@ -119,19 +120,19 @@ export class DeliveryQueue {
 type MutableMax = Record<string, (...args: any[]) => Promise<any>>;
 
 /** Journal actual effects, not just updates: a retried handler must not repeat an earlier part. */
-export function journalMaxActions(max: MaxClient, store: BridgeDatabase, onPrepared?: (cid: number) => void): void {
+export function journalMaxActions(max: MaxClient, store: BridgeDatabase, onPrepared?: (cid: number, options?: { sendAt?: number }) => void): void {
   const obj = max as unknown as MutableMax;
-  for (const method of ['sendMessage', 'sendToNewDialog', 'editMessage', 'deleteMessages', 'addReaction', 'removeReaction', 'sendVote', 'markRead', 'pinMessage']) {
+  for (const method of ['sendMessage', 'sendToNewDialog', 'forwardMessage', 'editMessage', 'deleteMessages', 'addReaction', 'removeReaction', 'sendVote', 'markRead', 'pinMessage', 'saveFolder', 'deleteFolder', 'changeProfile']) {
     const original = obj[method]?.bind(max);
     if (!original) continue;
     obj[method] = async (...args: unknown[]) => {
       const active = context.getStore();
-      const isSend = method === 'sendMessage' || method === 'sendToNewDialog';
+      const isSend = method === 'sendMessage' || method === 'sendToNewDialog' || method === 'forwardMessage';
       if (!active) {
         if (isSend) {
-          const cid = store.nextCid();
+          const cid = store.nextCid() * (method === 'forwardMessage' ? -1 : 1);
           args[4] = { ...(args[4] as object | undefined), cid };
-          onPrepared?.(cid);
+          onPrepared?.(cid, args[4] as { sendAt?: number });
         }
         return original(...args);
       }
@@ -156,7 +157,7 @@ export function journalMaxActions(max: MaxClient, store: BridgeDatabase, onPrepa
           }
         }
       }
-      if (isSend) { savedArgs[4] = { ...(savedArgs[4] as object | undefined), cid: effect.cid }; onPrepared?.(effect.cid!); }
+      if (isSend) { savedArgs[4] = { ...(savedArgs[4] as object | undefined), cid: effect.cid }; onPrepared?.(effect.cid!, savedArgs[4] as { sendAt?: number }); }
       // FULL synchronous commit before the network write.
       store.markEffect(effect.key, 'running');
       let receivedResult = false;
@@ -189,6 +190,13 @@ async function reconcileSend(max: MaxClient, effect: EffectRecord): Promise<unkn
     }) as { id?: unknown } | undefined;
     if (candidate?.id == null) return null;
     chatId = candidate.id;
+  }
+  // Scheduled messages are not in regular history before their firing time.
+  const scheduledAt = (effect.args[4] as { sendAt?: number } | undefined)?.sendAt;
+  if (scheduledAt) {
+    const delayed = await max.getChatHistory(chatId, Math.max(Date.now(), scheduledAt) + 86_400_000, 100, 'DELAYED');
+    const match = delayed.find(m => m.cid != null && String(m.cid) === String(effect.cid) && m.id != null);
+    if (match) return { cid: effect.cid, messageId: match.id, attaches: match.attaches ?? [], time: match.time };
   }
   // A positive cid match is a proof. Failure to find it is NOT proof that a send never landed.
   let from = Date.now() + 15 * 60_000;

@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover stalled Telemax event loop
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 /srv/telemax/watchdog.py
+NoNewPrivileges=yes
+PrivateTmp=yes
+TimeoutStartSec=120

@@ -30,7 +30,15 @@ export function installStandaloneTelegram(bot: Telegraf, destination: string, av
     if (method === 'createForumTopic') throw new Error('A separate group cannot acquire another MAX chat.');
     if (method === 'deleteForumTopic') return true; // Never delete the real group through a topic operation.
     if (method === 'editForumTopic') {
-      return (original as Function)('setChatTitle', { chat_id: destination, title: standaloneTitle(payload.name ?? 'MAX') }, extra);
+      try {
+        return await (original as Function)('setChatTitle', { chat_id: destination, title: standaloneTitle(payload.name ?? 'MAX') }, extra);
+      } catch (error) {
+        const response = (error as { response?: { error_code?: number; description?: string } }).response;
+        // Topic liveness probes rename to the current title. Telegram uses a different
+        // "not modified" error for ordinary groups; it still proves that the group exists.
+        if (response?.error_code === 400 && /not modified|CHAT_NOT_MODIFIED/i.test(response.description ?? '')) return true;
+        throw error;
+      }
     }
     return (original as Function)(method, payload, extra);
   }) as typeof bot.telegram.callApi;

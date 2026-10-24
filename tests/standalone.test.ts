@@ -12,6 +12,7 @@ import { standaloneMax, standaloneUpdate, installStandaloneTelegram } from '../s
 import { DeliveryQueue, journalMaxActions } from '../src/bridge/deliveryQueue.js';
 import type { BridgeOptions } from '../src/bridge/sync.js';
 import { DIR, OPCODES } from '../src/max/opcodes.js';
+import { probeTopic } from '../src/bridge/sync.js';
 
 let db: BridgeDatabase, directory: string, manager: SeparateGroups | undefined;
 beforeEach(async () => {
@@ -81,6 +82,12 @@ describe('plain group isolation and delivery', () => {
   it('never binds a third-party group, or a group with an extra participant', async () => {
     const h = await setup(3); await h.bind(99); expect(manager!.records()).toHaveLength(0);
     await h.bind(); expect(manager!.records()).toHaveLength(0); expect((await h.map.getByMaxChatId('55'))!.banned).not.toBe(true);
+  });
+  it('treats an unchanged plain-group name as alive for safe deletion probes', async () => {
+    await setup();
+    vi.mocked(Telegram.prototype.callApi).mockRejectedValueOnce({ response: { error_code: 400, description: 'Bad Request: chat title is not modified' } });
+    const child = new Telegraf('123:FAKE_TOKEN'); installStandaloneTelegram(child, '-200', () => true);
+    await expect(probeTopic(child, '-200', 1, 'Contact label')).resolves.toBe('alive');
   });
   it('keeps the old map/history and permanently associates one MAX chat with the new group', async () => {
     const h = await setup(); await h.bind();

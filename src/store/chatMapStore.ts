@@ -15,6 +15,8 @@ export interface ChatMapping {
   // Set by /ban: incoming messages are dropped and the topic deleted. The mapping is KEPT so the
   // ban survives restarts; /unban flips it back and the next message recreates the topic.
   banned?: boolean;
+  /** New traffic uses a separate plain group; preserve this topic and all old aliases. */
+  separateTelegramChatId?: string;
   // A PENDING 1:1: the panel's "Начать чат" created a topic for a fresh contact, but MAX has no
   // dialog yet (a 1:1 is only created by the first message). Holds the contact's userId; the first
   // outbound message opens the real dialog (client.sendToNewDialog) and rewrites this into a real
@@ -100,6 +102,7 @@ export class ChatMapStore {
     createdAt: string;
     historyBackfillCursor?: string;
     banned?: boolean;
+    separateTelegramChatId?: string;
     pendingUserId?: string;
   }): Promise<void> {
     const normalized: ChatMapping = { ...mapping, maxChatId: String(mapping.maxChatId) };

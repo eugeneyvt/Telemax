@@ -11,7 +11,8 @@ import { BridgeDatabase } from '../store/bridgeDatabase.js';
 import { currentDelivery, type DeliveryQueue } from '../bridge/deliveryQueue.js';
 import { SettingsStore } from '../store/settingsStore.js';
 import { DEFAULT_HISTORY_DAYS } from '../bridge/history.js';
-import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
+import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp, type BridgeOptions } from '../bridge/sync.js';
+import { SeparateGroups } from '../bridge/separateGroups.js';
 import { systemView } from '../bridge/panel.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
 import { isStaleCallbackQuery, isTransientTelegramError } from '../bridge/transient.js';
@@ -59,12 +60,13 @@ const sessionStore = new SessionStore();
 const destinationDir = path.join(process.cwd(), '.data', `telegram-${config.targetTelegramGroup || 'unconfigured'}`);
 const chatMapStore = new ChatMapStore(path.join(destinationDir, 'chat-map.json'));
 const database = config.telegramEnabled ? new BridgeDatabase(path.join(destinationDir, 'bridge.sqlite')) : undefined;
-process.once('exit', () => database?.close());
+process.once('exit', () => { separateGroups?.closeDatabases(); database?.close(); });
 const settingsStore = new SettingsStore();
 const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 
 let bot: Telegraf | null = null;
 let deliveryQueue: DeliveryQueue | undefined;
+let separateGroups: SeparateGroups | undefined;
 let chatSync: ChatCatchUp | null = null;
 // «📜 Сколько истории перенести?» (sync.ts) — asked before a sync that fills every chat from scratch.
 let askHistoryDepth: (() => Promise<number>) | null = null;
@@ -203,10 +205,11 @@ function syncChatsIfPossible(): Promise<void> {
     if (askHistoryDepth && historyQuestionDue?.() && (await chatMapStore.list()).length === 0) await askHistoryDepth();
     await syncAllChatsToTelegram(
       sync,
-      cachedChats,
+      cachedChats.filter((chat: any) => !separateGroups?.byMax(chat?.id)),
       (chat) => resolveChatName(chat, myAccountId, contactProfiles),
       () => generation !== chatSyncGeneration,
     );
+    await separateGroups?.sync();
   })()
     .catch((err) => {
       catchUpRetryRequestedDuringRun = true; // not a clean run — keep the backoff where it is
@@ -404,10 +407,7 @@ async function startServer(): Promise<void> {
         );
         void reportError({ kind: 'internal', step: 'telegram-handler', error: err });
       });
-      installGroupDiscovery(bot, config.telegramOwnerId, config.targetTelegramGroup, async candidate => {
-        await writeFile(path.join(process.cwd(), '.data', 'group-candidate.json'), JSON.stringify(candidate), { mode: 0o600 });
-      });
-      ({ chatSync, askHistoryDepth, historyQuestionDue, deliveryQueue } = wireBridge({
+      const bridgeOptions: BridgeOptions = {
         max,
         bot,
         chatMapStore,
@@ -438,7 +438,16 @@ async function startServer(): Promise<void> {
           until: () => maxSession.pausedUntil,
         },
         restartBridge: (where) => void restartFromPanel(where),
+      };
+      separateGroups = new SeparateGroups(bridgeOptions, () => createBotSafely(config.telegramBotToken)!);
+      await separateGroups.start();
+      installGroupDiscovery(bot, config.telegramOwnerId, config.targetTelegramGroup, async candidate => {
+        await writeFile(path.join(process.cwd(), '.data', 'group-candidate.json'), JSON.stringify(candidate), { mode: 0o600 });
+      });
+      ({ chatSync, askHistoryDepth, historyQuestionDue, deliveryQueue } = wireBridge({ ...bridgeOptions,
+        getChats: () => cachedChats.filter((chat: any) => !separateGroups?.byMax(chat?.id)),
       }));
+      separateGroups.installInbox();
       chatSync.setRetryHandler(scheduleCatchUpRetry);
       watchPolling(bot);
       launchTelegramBotWithRetry(bot);
@@ -456,8 +465,13 @@ async function startServer(): Promise<void> {
   // the Telegram bot now (see /login, the /panel menu). MAX runs over an outbound TCP socket
   // and Telegram over long-polling, so nothing needs to listen on a port.
   let healthWriting = false;
-  const healthInput = (): HealthInput => ({ startedAt, maxState: maxSession.state, telegramEnabled: config.telegramEnabled, telegramActive: tgActive, lastTelegramPollAt, paused: maxSession.state === 'paused',
-    queue: database?.health(), incomingUncertain: database?.values<{ created?: number }>('incomingPending').filter(p => typeof p.created === 'number' && Date.now() - p.created > 180_000).length ?? 0 });
+  const healthInput = (): HealthInput => {
+    const primary = database?.health(); const separate = separateGroups?.health();
+    const oldest = [primary?.oldestAt, separate?.oldestAt].filter((n): n is number => n != null);
+    return { startedAt, maxState: maxSession.state, telegramEnabled: config.telegramEnabled, telegramActive: tgActive, lastTelegramPollAt, paused: maxSession.state === 'paused',
+      queue: primary ? { pending: primary.pending + (separate?.pending ?? 0), failed: primary.failed + (separate?.failed ?? 0), uncertain: primary.uncertain + (separate?.uncertain ?? 0), oldestAt: oldest.length ? Math.min(...oldest) : null } : undefined,
+      incomingUncertain: (database?.values<{ created?: number }>('incomingPending').filter(p => typeof p.created === 'number' && Date.now() - p.created > 180_000).length ?? 0) + (separate?.incoming ?? 0) };
+  };
   const healthServer = process.env.HEALTH_PORT ? serveBridgeHealth(healthInput, process.env.HEALTH_TOKEN ?? '', Number(process.env.HEALTH_PORT)) : undefined;
   healthServer?.on('error', () => { logger.error('Health endpoint could not listen'); process.exitCode = 1; });
   const healthTick = async () => {
@@ -486,6 +500,7 @@ async function startServer(): Promise<void> {
     }
     maxSession.shutdown();
     deliveryQueue?.stop();
+    void separateGroups?.stop();
     // Let in-flight work (a mid-write store persist, the polling loop's teardown)
     // drain naturally; the timer is the failsafe so a lingering keep-alive socket
     // or maintenance interval can't hold the process past docker's stop timeout.
@@ -557,6 +572,9 @@ const BOT_COMMANDS = [
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
   { command: 'delete', description: 'Удалить сообщение с обеих сторон (ответом)' },
   { command: 'read', description: 'Отметить прочитанным в MAX (ответом или в теме)' },
+  { command: 'receipt', description: 'Проверить прочтение исходящего сообщения в MAX (ответом)' },
+  { command: 'separate', description: 'Выделить этот MAX-чат в отдельную группу с аватаркой' },
+  { command: 'groups', description: 'Подключённые отдельные группы MAX' },
   { command: 'pin', description: 'Закрепить сообщение в MAX (ответом)' },
   { command: 'unpin', description: 'Снять закрепление в MAX (в теме)' },
   { command: 'queue', description: 'Состояние сохранённых заданий доставки' },

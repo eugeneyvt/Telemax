@@ -15,6 +15,19 @@ function setup() {
 const mark = (value = 1700000000000) => ({ chatId: 55, userId: 2, mark: value, setAsUnread: false });
 
 describe('MAX read receipt rendering', () => {
+  it('initializes old read evidence from chat snapshots without waiting for a new push', async () => {
+    const { receipts, sendMessage } = setup(); receipts.seed({ id: 55, participants: { 1: 1700000000000, 2: 1700000060000 } }); await receipts.flush();
+    expect(sendMessage.mock.calls[0]?.[1]).toContain('прочитано до'); expect(db.values('readMarks')).toHaveLength(1);
+  });
+  it('recovers an outgoing status refresh even when the peer has never sent a read marker', async () => {
+    const h = setup(); h.receipts.touch('55');
+    const receipts = new ReadReceipts({ ...h.deps, latestOutgoing: async () => ({ time: 1700000000000, telegramId: 7 }) });
+    await receipts.flush(); expect(h.sendMessage.mock.calls[0]?.[1]).toContain('подтверждения прочтения пока нет');
+  });
+  it('does not roll an explicit unread toggle back from an unchanged cached chat snapshot', () => {
+    const { receipts } = setup(); receipts.accept({ ...mark(), setAsUnread: true });
+    receipts.seed({ id: 55, participants: { 2: 1700000000000 } }); expect(db.values<any>('readMarks')[0].setAsUnread).toBe(true);
+  });
   it('ignores the owner, malformed marks and events with unknown semantics', () => {
     const { receipts } = setup();
     expect(receipts.accept({ ...mark(), userId: 1 })).toBe(false);

@@ -46,7 +46,7 @@ export class BridgeDatabase {
   private readonly db: DatabaseSync;
   private readonly ownerLock: DatabaseSync;
   private closed = false;
-  constructor(readonly file: string) {
+  constructor(readonly file: string, private readonly allocateCid?: () => number) {
     if (file !== ':memory:') mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(file);
     if (file !== ':memory:') chmodSync(file, 0o600);
@@ -172,6 +172,7 @@ export class BridgeDatabase {
   }
   cancelPending(): void { this.db.exec("UPDATE jobs SET status='done',error='cancelled by owner' WHERE status!='done'"); }
   nextCid(): number {
+    if (this.allocateCid) return this.allocateCid();
     const cid = Math.max(Date.now(), (this.get<number>('meta', 'lastCid') ?? 0) + 1);
     this.set('meta', 'lastCid', cid);
     return cid;

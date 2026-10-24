@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { wireNativeTools, isDurableCommand } from './nativeTools.js';
 import { ReadReceipts } from './readReceipts.js';
+import { participantReadMarks, messageReceiptText } from './receiptDetails.js';
 import { ReactionStore } from './reactionStore.js';
 import { TelegramAlbums, isTelegramAlbum } from './telegramAlbums.js';
 import { albumFamily, sendAttachmentAlbum } from './attachmentAlbums.js';
@@ -16,7 +17,7 @@ import { Markup, type Context, type Telegraf } from 'telegraf';
 import type { ChatAction, Message, TelegramEmoji } from 'telegraf/types';
 import { CONTACT_FLAG_ADDED, isAddedContact, type MaxClient, type MaxContactInfo, type MaxLinkChat, type MaxMessageEvent, type MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
-import { resolveContactDisplayName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
+import { resolveContactDisplayName, resolveContactTopicName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
 import { cursorToMs, type ChatMapStore } from '../store/chatMapStore.js';
 import type { SettingsStore } from '../store/settingsStore.js';
 import { BridgeDatabase } from '../store/bridgeDatabase.js';
@@ -1759,6 +1760,8 @@ function formatVersionMessage(status: VersionStatus): { text: string; replyMarku
 }
 
 export interface BridgeOptions {
+  /** A separate, plain Telegram group for exactly one MAX chat. */
+  standalone?: { maxChatId: string; stateDirectory: string };
   max: MaxClient;
   bot: Telegraf;
   chatMapStore: ChatMapStore;
@@ -1796,6 +1799,8 @@ export interface BridgeOptions {
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
 export interface WiredBridge {
+  acceptUpdate: (update: Update, polling?: boolean) => Promise<void>;
+  stop: () => Promise<void>;
   /** The per-chat queues and catch-up state — pass to syncAllChatsToTelegram (see ChatCatchUp). */
   chatSync: ChatCatchUp;
   /** «📜 Сколько истории перенести?» in the group — before every chat is filled from scratch; resolves with the days chosen (saved). */
@@ -1806,6 +1811,7 @@ export interface WiredBridge {
 }
 
 export function wireBridge({
+  standalone,
   max,
   bot,
   chatMapStore,
@@ -1842,7 +1848,7 @@ export function wireBridge({
   const broadcasts = createBroadcasts({
     bot,
     targetGroupId,
-    store: new BroadcastStore(),
+    store: new BroadcastStore(standalone ? path.join(standalone.stateDirectory, 'broadcasts.json') : undefined),
     chatTitle: async (maxChatId) => resolveTopicTitle(maxChatId) ?? (await chatMapStore.getByMaxChatId(maxChatId))?.title ?? 'Чат',
     topicOf: async (maxChatId) => (await chatMapStore.getByMaxChatId(maxChatId))?.telegramTopicId,
     chatOfTopic: async (topicId) => (await chatMapStore.getByTopicId(topicId))?.maxChatId,
@@ -2069,10 +2075,23 @@ export function wireBridge({
     (edit, link) => replaceIncomingMedia(bot, max, targetGroupId, edit.topicId, link, edit.attaches!, att => sendAttachments(bot, targetGroupId, edit.topicId, [att], { max, chatId: edit.maxChatId, messageId: edit.maxMessageId, throwOnTransient: true }))) : undefined;
   const telegramAlbums = database ? new TelegramAlbums(database, targetGroupId) : undefined;
   const readReceipts = database ? new ReadReceipts({ db: database, bot, destination: targetGroupId, ownId: getMyAccountId,
-    topic: chatId => chatMapStore.getByMaxChatId(chatId),
-    name: async userId => resolveContactDisplayName(Number(userId), await resolveProfile(max, Number(userId), 'read receipt', getContactProfiles())),
+    topic: async chatId => {
+      const mapping = await chatMapStore.getByMaxChatId(chatId);
+      return mapping?.separateTelegramChatId ? undefined : mapping;
+    },
+    name: async userId => resolveContactTopicName(Number(userId), await resolveProfile(max, Number(userId), 'read receipt', getContactProfiles())),
+    latestOutgoing: async chatId => {
+      const link = database.links<MessageLink>(chatId, true, 1)[0];
+      if (!link) return undefined;
+      const messages = await max.getMessages(chatId, linkMaxIds(link));
+      const time = Math.max(...messages.map(m => Number(m.time)).filter(Number.isSafeInteger));
+      return Number.isSafeInteger(time) && time > 0 ? { time, telegramId: link.telegramMessageId } : undefined;
+    },
   }) : undefined;
-  const readTimer = setInterval(() => { if (max.isLoggedIn && !wiping) void readReceipts?.flush().catch(err => logger.error('Read receipt update failed; saved for retry', err)); }, 5000);
+  const readTimer = setInterval(() => { if (max.isLoggedIn && !wiping) {
+    for (const chat of getChats()) if (database?.links<MessageLink>(String((chat as { id?: unknown }).id), true, 1).length) readReceipts?.seed(chat);
+    void readReceipts?.flush().catch(err => logger.error('Read receipt update failed; saved for retry', err));
+  } }, 5000);
   readTimer.unref();
   interface QueuedUpdate { update: Update; operationMapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; mapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; link?: MessageLink; linkFrozen?: boolean; pollLink?: PollLink }
   const deliveryQueue = database ? new DeliveryQueue(database, async (payload) => {
@@ -2144,6 +2163,7 @@ export function wireBridge({
       if (link) mapping = await chatMapStore.getByMaxChatId(link.maxChatId);
     }
     if (!mapping || mapping.banned) return;
+    if (mapping.separateTelegramChatId && message && !u.edited_message && !message.text?.startsWith('/')) return;
     if (message?.media_group_id && !u.edited_message && telegramAlbums) {
       telegramAlbums.add(update, mapping);
       return;
@@ -2157,6 +2177,13 @@ export function wireBridge({
     // Before every content/operation handler, after access control and before acknowledgement.
     bot.use(async (ctx, next) => {
       if (currentDelivery()) return next();
+      const original = ctx.message as { message_thread_id?: number; text?: string } | undefined;
+      if (original?.message_thread_id && !original.text?.startsWith('/')) {
+        const mapping = await chatMapStore.getByTopicId(original.message_thread_id);
+        if (mapping?.separateTelegramChatId) {
+          await ctx.reply('Новая переписка этого чата перенесена в отдельную группу MAX. Здесь сохранена прежняя история. Список: /groups'); return;
+        }
+      }
       await acceptUpdate(ctx.update);
       const exists = database.hasJob(`${targetGroupId}:${ctx.update.update_id}`);
       // Completed updates are also deduplicated; enqueue's unique key is retained permanently.
@@ -2242,6 +2269,9 @@ export function wireBridge({
     const queued = currentDelivery()?.payload as QueuedUpdate | undefined;
     const mapping = queued?.mapping ? await chatMapStore.getByMaxChatId(queued.mapping.maxChatId) : await chatMapStore.getByTopicId(topic);
     if (!mapping || mapping.banned) throw new Error('Чат недоступен; операция сохранена в очереди.');
+    if (mapping.separateTelegramChatId && /^\/(silent|schedule)(?:@\w+)?(?:\s|$)/.test((ctx.message as { text?: string }).text ?? '')) {
+      await ctx.reply('Отправляйте новые сообщения в отдельной группе этого MAX-чата. Список: /groups'); return null;
+    }
     const reply = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
     const link = reply && reply.message_id !== topic ? operationLink(reply.message_id) : undefined;
     if (link && String(link.maxChatId) !== String(mapping.maxChatId)) throw new Error('Сообщение принадлежит другому чату MAX.');
@@ -2254,6 +2284,22 @@ export function wireBridge({
     if (!link) { await ctx.reply('Ответьте /read на сообщение MAX, которое нужно отметить прочитанным.'); return; }
     await max.markRead(link.maxChatId, link.maxMessageId);
     await ctx.reply('✅ В MAX отмечено прочитанным до выбранного сообщения.', { message_thread_id: target.mapping.telegramTopicId });
+  });
+  bot.command('receipt', async ctx => {
+    // Read-only inspection remains available in the preserved old topic after it moves to a group.
+    const topicId = ctx.message.message_thread_id;
+    const mapping = topicId ? await chatMapStore.getByTopicId(topicId) : undefined;
+    const replyId = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message?.message_id;
+    const link = replyId ? messageLinks.getByTelegram(replyId) : undefined;
+    if (!mapping || !link || String(link.maxChatId) !== mapping.maxChatId) { await ctx.reply('Ответьте /receipt на исходящее сообщение, чтобы проверить его прочтение в MAX.'); return; }
+    const target = { mapping, link };
+    const messages = await max.getMessages(target.link.maxChatId, linkMaxIds(target.link));
+    const latest = messages.sort((a, b) => Number(b.time) - Number(a.time))[0];
+    if (!latest) { await ctx.reply('MAX не вернул исходное сообщение; статус неизвестен.'); return; }
+    const chat = (await max.chatsInfo([target.link.maxChatId]))[0];
+    readReceipts?.seed(chat);
+    await ctx.reply(await messageReceiptText(latest, participantReadMarks(chat, getMyAccountId()), getMyAccountId(), async id => resolveContactTopicName(Number(id), await resolveProfile(max, Number(id), 'receipt details', getContactProfiles()))), { message_thread_id: target.mapping.telegramTopicId,
+      reply_parameters: { message_id: target.link.telegramMessageId, allow_sending_without_reply: true } });
   });
   bot.command('pin', async (ctx) => {
     const target = await operationTarget(ctx);
@@ -2328,13 +2374,14 @@ export function wireBridge({
   function rememberOutgoingSend(chatId: unknown, cid: number, serverTime: unknown): void {
     outgoingCids.remember(cid);
     lastOutAt = Date.now();
+    readReceipts?.touch(chatId);
     chatSync.runInChat(chatId, () => chatSync.advanceCursor(chatId, serverTime, 'outgoing send')).catch(() => undefined);
   }
 
   // Big files through links (fileShare.ts / bigFiles.ts): Telegram's bot limits are 20 MB down and
   // 50 MB up, MAX takes 4 GB.
-  const fileShare = new FileShare(path.join(process.cwd(), '.data'), fileShareOptionsFromEnv());
-  void fileShare
+  const fileShare = new FileShare(standalone?.stateDirectory ?? path.join(process.cwd(), '.data'), { ...fileShareOptionsFromEnv(), ...(standalone ? { enabled: false } : {}) });
+  if (!standalone) void fileShare
     .init()
     .then(() => fileShare.startBackground())
     .catch((err) => logger.error('Big-file storage failed to start', err));
@@ -2413,7 +2460,7 @@ export function wireBridge({
   // MAX sends no live push for reaction removal (see handleMaxChatUpdate): poll each message with
   // an active relayed reaction and clear it in Telegram once MAX reports it gone.
   const REACTION_POLL_INTERVAL_MS = 60_000;
-  setInterval(() => void pollReactionRemovals(), REACTION_POLL_INTERVAL_MS).unref();
+  const reactionTimer = setInterval(() => void pollReactionRemovals(), REACTION_POLL_INTERVAL_MS); reactionTimer.unref();
 
   async function pollReactionRemovals(): Promise<void> {
     for (const [key, relayed] of lastRelayedReaction) {
@@ -2456,7 +2503,7 @@ export function wireBridge({
   const PROBE_TICK_MS = 15_000;
   const PROBE_MAX_PER_TICK = 12; // comfortably under Telegram's ~30 req/s global cap
   const probeLastAt = new Map<string, number>();
-  setInterval(() => void runProbeTick(), PROBE_TICK_MS).unref();
+  const probeTimer = setInterval(() => void runProbeTick(), PROBE_TICK_MS); probeTimer.unref();
 
   /** Deletes a forum topic. One already gone (deleted by hand) is the wanted outcome, not an error. Never throws. */
   async function deleteTopic(topicId: number, what: string): Promise<void> {
@@ -2498,6 +2545,7 @@ export function wireBridge({
     const due: MessageLink[] = [];
     const liveKeys = new Set<string>();
     for (const link of messageLinks.outgoingLinks()) {
+      if ((await chatMapStore.getByMaxChatId(link.maxChatId))?.separateTelegramChatId) continue;
       const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
       liveKeys.add(key);
       const interval = probeIntervalMs(now - (link.createdAt ?? now));
@@ -2582,12 +2630,12 @@ export function wireBridge({
   // Roughly once a day at a jittered offset — spreads GitHub API calls out across installs.
   const VERSION_CHECK_MIN_MS = 20 * 60 * 60 * 1000;
   const VERSION_CHECK_MAX_MS = 28 * 60 * 60 * 1000;
-  scheduleVersionCheck();
+  if (!standalone) scheduleVersionCheck();
 
   // Anonymous install counter (opt out with TELEMETRY=off). Pinged once shortly after boot so
   // a fresh install registers without waiting up to a day, then on every version-check tick.
   const telemetry = createTelemetry();
-  setTimeout(() => void telemetry.ping(), 60_000).unref();
+  if (!standalone) setTimeout(() => void telemetry.ping(), 60_000).unref();
 
   function scheduleVersionCheck(): void {
     const delay = VERSION_CHECK_MIN_MS + Math.random() * (VERSION_CHECK_MAX_MS - VERSION_CHECK_MIN_MS);
@@ -2916,7 +2964,7 @@ export function wireBridge({
     if (!forceOwn && message.cid != null && (outgoingCids.has(message.cid) || (String(message.sender) === String(getMyAccountId()) && database?.hasPendingCid(message.cid))) && message.status !== 'REMOVED') return;
     // Banned chat (/ban): drop everything for it — no mirror, no topic recreate.
     const banCheck = await chatMapStore.getByMaxChatId(chatId);
-    if (banCheck?.banned) return;
+    if (banCheck?.banned || banCheck?.separateTelegramChatId) return;
 
     let text = message.text;
     let attaches = Array.isArray(message.attaches) ? message.attaches : [];
@@ -3315,6 +3363,9 @@ export function wireBridge({
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
 /read — отметить сообщение прочитанным в MAX: ответом на него или до последнего входящего в теме
+/receipt — подтверждённое MAX прочтение исходящего сообщения (ответом на него); прослушивание отдельно не подтверждается
+/separate — перенести новую переписку этой темы в отдельную закрытую Telegram-группу с именем и аватаркой MAX
+/groups — список отдельных групп (в основной группе управления)
 /pin — закрепить в MAX сообщение, на которое отвечаете
 /unpin — снять закрепление в MAX
 /queue — состояние сохранённых заданий доставки
@@ -3679,7 +3730,7 @@ export function wireBridge({
     }
   };
 
-  wireControlPanel({
+  if (!standalone) wireControlPanel({
     bot,
     targetGroupId,
     max,
@@ -4826,7 +4877,13 @@ export function wireBridge({
     await ctx.editMessageText(`📜 История для новых тем: ${historyDaysLabel(days)}. Поменять: /panel → ⚙️ Система.`).catch(() => {});
   });
 
-  return { chatSync, askHistoryDepth, historyQuestionDue, deliveryQueue };
+  return { chatSync, askHistoryDepth, historyQuestionDue, deliveryQueue, acceptUpdate,
+    stop: async () => {
+      wiping = true;
+      for (const timer of [pollTimer, reactionSummaryTimer, readTimer, reactionTimer, probeTimer]) clearInterval(timer);
+      deliveryQueue?.stop(); await deliveryQueue?.drain();
+      if (standalone) await chatSync.runInChat(standalone.maxChatId, async () => {});
+    } };
 }
 
 /**

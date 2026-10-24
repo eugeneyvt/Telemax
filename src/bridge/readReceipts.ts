@@ -1,6 +1,7 @@
 import type { Telegraf } from 'telegraf';
 import type { BridgeDatabase } from '../store/bridgeDatabase.js';
-import { isConnectFailure } from './transient.js';
+import { isConnectFailure, withFloodRetry } from './transient.js';
+import { participantReadMarks } from './receiptDetails.js';
 const description = (error: unknown) => (error as { response?: { description?: string }; message?: string })?.response?.description ?? (error as Error)?.message ?? '';
 const isMessageNotModified = (error: unknown) => /message is not modified/i.test(description(error));
 const isTelegramMessageMissing = (error: unknown) => /message to edit not found/i.test(description(error));
@@ -12,6 +13,7 @@ interface ReadReceiptDeps {
   ownId(): unknown;
   topic(chatId: string): Promise<{ telegramTopicId: number; banned?: boolean } | undefined>;
   name(userId: string): Promise<string>;
+  latestOutgoing?(chatId: string): Promise<{ time: number; telegramId: number } | undefined>;
 }
 
 /** MAX read markers are facts from MAX, never inferred from a Telegram delivery or page view. */
@@ -21,6 +23,7 @@ export class ReadReceipts {
   private flushing: Promise<void> | undefined;
   constructor(private readonly deps: ReadReceiptDeps) {
     for (const mark of deps.db.values<ReadMark>('readMarks')) this.pending.add(mark.chatId);
+    for (const item of deps.db.values<{ chatId: string }>('receiptChats')) this.pending.add(item.chatId);
   }
   accept(payload: unknown): boolean {
     const p = payload as { chatId?: unknown; userId?: unknown; mark?: unknown; setAsUnread?: unknown } | null;
@@ -36,6 +39,17 @@ export class ReadReceipts {
     this.versions.set(chatId, (this.versions.get(chatId) ?? 0) + 1);
     return true;
   }
+  seed(chat: unknown): void {
+    const chatId = (chat as { id?: unknown } | null)?.id;
+    if (chatId == null) return;
+    for (const p of participantReadMarks(chat, this.deps.ownId())) {
+      const old = this.deps.db.get<ReadMark>('readMarks', `${chatId}:${p.userId}`);
+      if (!old || p.mark > old.mark) this.accept({ chatId, ...p, setAsUnread: false });
+    }
+  }
+  touch(chatId: unknown): void {
+    const key = String(chatId); this.deps.db.set('receiptChats', key, { chatId: key }); this.pending.add(key); this.versions.set(key, (this.versions.get(key) ?? 0) + 1);
+  }
   flush(): Promise<void> {
     if (this.flushing) return this.flushing;
     this.flushing = this.run().finally(() => { this.flushing = undefined; });
@@ -43,7 +57,9 @@ export class ReadReceipts {
   }
   private async run(): Promise<void> {
     const { db, bot, destination } = this.deps;
+    let failure: unknown;
     for (const chatId of this.pending) {
+      try {
       const version = this.versions.get(chatId) ?? 0;
       const topic = await this.deps.topic(chatId);
       if (!topic || topic.banned) continue;
@@ -53,12 +69,19 @@ export class ReadReceipts {
         const time = new Date(m.mark).toLocaleString('ru-RU', { timeZone: process.env.TZ || 'Europe/Moscow' });
         return m.setAsUnread ? `${name}: отметил(а) чат непрочитанным` : `${name}: прочитано до ${time}`;
       }));
-      const text = '👁 Прочтение в MAX\n' + lines.join('\n');
+      const latest = await this.deps.latestOutgoing?.(chatId);
+      let latestLine = '';
+      if (latest) {
+        const readers = await Promise.all(marks.filter(m => m.mark >= latest.time && !m.setAsUnread).map(m => this.deps.name(m.userId)));
+        const url = destination.startsWith('-100') ? `https://t.me/c/${destination.slice(4)}/${latest.telegramId}` : '';
+        latestLine = `\n\nПоследнее исходящее${url ? `: ${url}` : ''}\n${readers.length ? `✓ Прочитано в MAX: ${readers.join(', ')}` : '✓ Есть в MAX · подтверждения прочтения пока нет'}\nДля статуса конкретного сообщения — /receipt ответом на него. Прослушивание отдельно не подтверждается.`;
+      }
+      const text = '👁 Прочтение в MAX\n' + (lines.join('\n') || 'Подтверждённых отметок от других участников пока нет.') + latestLine;
       const key = `${chatId}:${topic.telegramTopicId}`;
       const prior = db.get<ReadCard>('readCards', key);
       if (prior?.text === text) { this.pending.delete(chatId); continue; }
       if (prior) {
-        try { await bot.telegram.editMessageText(destination, prior.id, undefined, text); }
+        try { await withFloodRetry(() => bot.telegram.editMessageText(destination, prior.id, undefined, text)); }
         catch (error) {
           if (!isMessageNotModified(error)) {
             if (!isTelegramMessageMissing(error)) throw error;
@@ -73,7 +96,7 @@ export class ReadReceipts {
         if (intent) continue; // Telegram may have accepted the previous create before a lost ACK.
         db.set('readCardPending', key, true);
         try {
-          const sent = await bot.telegram.sendMessage(destination, text, { message_thread_id: topic.telegramTopicId, disable_notification: true });
+          const sent = await withFloodRetry(() => bot.telegram.sendMessage(destination, text, { message_thread_id: topic.telegramTopicId, disable_notification: true }));
           db.set('readCards', key, { id: sent.message_id, text });
           db.delete('readCardPending', key);
         } catch (error) {
@@ -83,6 +106,8 @@ export class ReadReceipts {
         }
       }
       if ((this.versions.get(chatId) ?? 0) === version) this.pending.delete(chatId);
+      } catch (error) { failure ??= error; }
     }
+    if (failure) throw failure;
   }
 }

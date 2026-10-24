@@ -110,6 +110,20 @@ describe('MaxClient pending waits', () => {
     vi.useRealTimers();
   });
 
+  it('destroys a timed-out socket so a late ACK cannot bind to a following send', async () => {
+    vi.useFakeTimers();
+    const { client, socket } = connectedClient();
+    const first = client.sendMessage(1, 'first').catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(await first).toBeInstanceOf(MaxConnectionLostError);
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    const second = client.sendMessage(1, 'second');
+    // Old socket lost its data listeners when the first request timed out.
+    socket.emit('data', serverFrame(OPCODES.MSG_SEND, { message: { id: 777n } }));
+    await expect(second).rejects.toThrow('not connected');
+    expect(socket.write).toHaveBeenCalledTimes(1);
+  });
+
   it('without a socket a request rejects at once and leaves no listener or timer behind', async () => {
     vi.useFakeTimers();
     const client = new MaxClient({ reconnect: false });

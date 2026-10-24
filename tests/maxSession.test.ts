@@ -6,6 +6,7 @@ import { configureErrorReporter } from '../src/bridge/errorReporter.js';
 import { MaxAuthUnavailableError } from '../src/bridge/maxAuthFlow.js';
 import { MaxSessionController } from '../src/server/maxSession.js';
 import type { MaxSession } from '../src/store/sessionStore.js';
+import { MaxPasswordSetupRequiredError } from '../src/max/authErrors.js';
 
 // The transitions that bit us before the controller existed: a pause that kept reconnecting, /kill
 // leaving timers behind, an abandoned /login parking the resume retries, network blips wiping a
@@ -269,6 +270,14 @@ describe('MaxSessionController — /login', () => {
     // The chain is over, so the pending resume retry reconnects at its next tick.
     await vi.advanceTimersByTimeAsync(5_000);
     expect(client.connect).toHaveBeenCalledTimes(2);
+  });
+  it('clears an auth chain refused until password setup, so the same SMS code is not sent again', async () => {
+    const { ctl, client } = setup(); await failedResume(client, REJECTED());
+    await ctl.requestSms('+79999999999');
+    client.verifyCode.mockRejectedValueOnce(new MaxPasswordSetupRequiredError());
+    await expect(ctl.verifyCode('000000')).rejects.toBeInstanceOf(MaxPasswordSetupRequiredError);
+    await expect(ctl.verifyCode('000000')).rejects.toBeInstanceOf(MaxAuthUnavailableError);
+    expect(client.verifyCode).toHaveBeenCalledOnce();
   });
 });
 

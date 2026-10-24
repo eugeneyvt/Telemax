@@ -2,6 +2,7 @@ import { Markup, type Context } from 'telegraf';
 import { createLogger } from '../logger.js';
 import { maskPhone } from './status.js';
 import { isTransientMaxError } from './transient.js';
+import { MaxPasswordSetupRequiredError } from '../max/authErrors.js';
 
 const logger = createLogger('maxauth');
 
@@ -31,6 +32,7 @@ export class MaxAuthUnavailableError extends Error {
 }
 
 export interface MaxAuthFlow {
+  hasPending: (chatId: number) => boolean;
   /**
    * Handle a PRIVATE-chat update if it belongs to the /login flow — a trigger (`/login`, deep-link
    * `/start login`), an inline confirm button, or an in-progress step. Returns true when consumed,
@@ -50,11 +52,12 @@ interface Flow {
 // be swallowed as auth input instead of becoming a bug report). Ten minutes is plenty for an SMS.
 const FLOW_TTL_MS = 10 * 60_000;
 
-export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCallbacks }): MaxAuthFlow {
+export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCallbacks; ownerUserId?: number }): MaxAuthFlow {
   const { targetGroupId, auth } = opts;
   const flows = new Map<number, Flow>();
 
   async function isGroupAdmin(ctx: Context, userId: number): Promise<boolean> {
+    if (opts.ownerUserId != null) return userId === opts.ownerUserId;
     // Not for MAX's sake (its SMS already proves account access) — this stops a STRANGER who finds
     // the bot from re-pointing the bridge at THEIR own MAX account, or SMS-spamming via requestSms.
     try {
@@ -113,6 +116,11 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
    * instead of the raw English client error, and the flow stays open.
    */
   async function replyKnownError(ctx: Context, chatId: number, err: unknown): Promise<boolean> {
+    if (err instanceof MaxPasswordSetupRequiredError) {
+      flows.delete(chatId);
+      await ctx.reply('🔐 MAX требует установить пароль для входа на устройстве, где аккаунт уже открыт.\n\nОткройте там MAX → Настройки → Безопасность → Пароль для входа → Установить пароль.\n\nПосле настройки вернитесь сюда и начните /login заново. Повторять прежний SMS-код не нужно. Пароль вводите только в личке этого бота, когда он его запросит.');
+      return true;
+    }
     if (err instanceof MaxAuthUnavailableError) {
       flows.delete(chatId);
       await ctx.reply(`❌ ${err.message}`);
@@ -197,9 +205,9 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
         await requestSmsThen(ctx, chatId, text);
         return true;
       case 'code':
+        await ctx.deleteMessage().catch(() => {}); // remove a one-time secret even when MAX rejects the next step
         try {
           const result = await auth.verifyCode(text);
-          await ctx.deleteMessage().catch(() => {}); // don't leave the code sitting in the chat
           if ('passwordRequired' in result) {
             setFlow(chatId, 'password');
             const hint = result.hint ? `\nПодсказка: ${result.hint}` : '';
@@ -230,5 +238,5 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
     }
   }
 
-  return { handlePrivate };
+  return { handlePrivate, hasPending: (chatId: number) => Boolean(freshFlow(chatId)) };
 }

@@ -32,6 +32,7 @@ export const OPCODES = {
   // user 2026-08-16.
   PUBLIC_SEARCH: 0x003c,
   CHAT_HISTORY: 0x0031,
+  CHAT_MARK: 0x0032,
   // Not in max-protocol-full.md — supplied by the user 2026-08-10.
   CHAT_DELETE: 0x0034,
   CHATS_LIST: 0x0035,

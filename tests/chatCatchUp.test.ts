@@ -321,6 +321,17 @@ describe('ChatCatchUp.restoreTopic', () => {
 });
 
 describe('syncAllChatsToTelegram', () => {
+  it('makes every topic available before a long first conversation starts importing', async () => {
+    const w = fakeWorld(); let topic = 100;
+    w.telegram.createForumTopic.mockImplementation(async (_group, name) => ({ message_thread_id: ++topic, name }));
+    w.getChatHistory.mockImplementation(async () => {
+      expect(await store.getByMaxChatId(9)).toBeDefined(); expect(await store.getByMaxChatId(10)).toBeDefined();
+      return [];
+    });
+    await syncAllChatsToTelegram(w.sync, [{ id: 9, status: 'ACTIVE' }, { id: 10, status: 'ACTIVE' }], chat => `Чат ${(chat as { id: number }).id}`);
+    expect(w.telegram.createForumTopic).toHaveBeenCalledTimes(2);
+    expect(w.sync.isCaughtUp(9)).toBe(true); expect(w.sync.isCaughtUp(10)).toBe(true);
+  });
   it('creates missing topics with their card, catches every chat up, and covers mapped chats missing from the snapshot', async () => {
     await store.upsert({ maxChatId: '8', telegramTopicId: 80, title: 'Старый', createdAt: 'x', historyBackfillCursor: '150' });
     await store.upsert({ maxChatId: '11', telegramTopicId: 81, title: 'Бан', createdAt: 'x', banned: true });

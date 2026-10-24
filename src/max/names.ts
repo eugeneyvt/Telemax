@@ -33,7 +33,7 @@ function fullName(names: RawName[] | undefined, type: string): string | undefine
 }
 
 function label(names: RawName[] | undefined, type: string): string | undefined {
-  const name = names?.find((n) => n.type === type)?.name;
+  const name = names?.find((n) => n.type === type)?.name?.trim();
   return name || undefined;
 }
 
@@ -65,6 +65,11 @@ export function resolveContactDisplayName(id: number, profile: ContactProfile | 
     formatPhone(profile.phone) ??
     `MAX ID ${id}`
   );
+}
+
+/** A topic uses the owner's MAX contact label; author/profile cards keep the person's name. */
+export function resolveContactTopicName(id: number, profile: ContactProfile | undefined): string {
+  return label(profile?.names, 'CUSTOM') ?? fullName(profile?.names, 'CUSTOM') ?? resolveContactDisplayName(id, profile);
 }
 
 /**
@@ -102,7 +107,7 @@ export function resolveChatName(chat: unknown, myAccountId: number | null, conta
   const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
   if (looksLikeDialog(c, participantIds, myAccountId)) {
     const otherId = participantIds.find((id) => id !== myAccountId);
-    if (otherId != null) return resolveContactDisplayName(otherId, contactProfiles.get(otherId));
+    if (otherId != null) return resolveContactTopicName(otherId, contactProfiles.get(otherId));
   }
 
   if (c.title) return c.title;

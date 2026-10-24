@@ -218,19 +218,23 @@ async function uploadVideoToMax(
   buffer: Buffer,
   filename: string,
   contentType = 'video/mp4',
-): Promise<{ _type: 'VIDEO'; videoId: unknown; token: string }> {
-  const slot = await max.requestVideoUpload();
-  const readyPromise = max.waitForVideoReady(slot.videoId, uploadReadyTimeoutMs(buffer.length)); // start listening before the POST so the push can't arrive unheard
+  round = false,
+  duration = 0,
+): Promise<{ _type: 'VIDEO'; videoId: unknown; token: string; videoType?: number; duration?: number; thumbhash?: Buffer }> {
+  const slot = await max.requestVideoUpload(round);
+  // Direct circles (uploaderType 1) finish in the HTTP response, without an EVENTS
+  // video-ready push. Ordinary videos still need the processing notification.
+  const readyPromise = round ? Promise.resolve() : max.waitForVideoReady(slot.videoId, uploadReadyTimeoutMs(buffer.length));
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
   // "internal bridge error"); the await below still sees its outcome.
   readyPromise.catch(() => {});
   const res = await postToMax(slot.url, {
     method: 'POST',
     headers: {
-      'Content-Type': contentType,
-      'Content-Range': `bytes 0-${buffer.length - 1}/${buffer.length}`,
+      'Content-Type': round ? 'application/octet-stream' : contentType,
+      ...(!round ? { 'Content-Range': `bytes 0-${buffer.length - 1}/${buffer.length}` } : {}),
       'Content-Length': String(buffer.length),
-      'Content-Disposition': contentDispositionFor(filename),
+      'Content-Disposition': round ? `attachment; filename=${encodeURIComponent(filename)}` : contentDispositionFor(filename),
     },
     body: buffer,
   });
@@ -239,10 +243,14 @@ async function uploadVideoToMax(
     throw new Error(`Video upload POST failed: ${res.status} ${res.statusText} — ${bodyText}`);
   }
   await readyPromise;
-  return { _type: 'VIDEO', videoId: slot.videoId, token: slot.token };
+  const direct = round ? await res.json() as { thumbhash?: unknown } : undefined;
+  const hash = direct?.thumbhash;
+  const thumbhash = typeof hash === 'string' && /^[A-Za-z0-9+/_-]+={0,2}$/.test(hash) ? Buffer.from(hash, 'base64') : undefined;
+  if (round && !thumbhash?.length) throw new Error('MAX не подтвердил обработку кружка: нет thumbhash в ответе прямой загрузки.');
+  return { _type: 'VIDEO', videoId: slot.videoId, token: slot.token, ...(round ? { videoType: 1, duration: Math.round(duration * 1000), ...(thumbhash ? { thumbhash } : {}) } : {}) };
 }
 
-export type UploadKind = 'photo' | 'document' | 'video' | 'voice' | 'sticker_animated';
+export type UploadKind = 'photo' | 'document' | 'video' | 'video_note' | 'voice' | 'sticker_animated';
 
 /** Downloads a Telegram attachment and uploads it to MAX, returning the attach object for MSG_SEND. `duration` (seconds) is only used for 'voice'. */
 export async function uploadTelegramAttachmentToMax(
@@ -276,6 +284,7 @@ export async function uploadTelegramAttachmentToMax(
   }
   if (kind === 'photo') return uploadPhotoToMax(max, uploadBuffer);
   if (kind === 'video') return uploadVideoToMax(max, uploadBuffer, filename);
+  if (kind === 'video_note') return uploadVideoToMax(max, uploadBuffer, filename, 'video/mp4', true, duration);
   if (kind === 'voice') return uploadVoiceToMax(max, uploadBuffer, filename, duration);
   return uploadFileToMax(max, uploadBuffer, filename);
 }

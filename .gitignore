@@ -31,3 +31,6 @@ max-protocol-full.md
 # needed to run/deploy the app, just an old manual test
 scripts/dev/test-bridge-telegram.ts
 *.pid
+
+# Local audit evidence includes downloaded third-party source snapshots.
+research/

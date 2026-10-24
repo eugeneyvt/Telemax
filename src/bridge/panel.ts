@@ -1089,7 +1089,9 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const userId = ctx.from?.id;
     if (userId == null) return;
     try {
-      const member = await ctx.telegram.getChatMember(targetGroupId, userId);
+      const member = Number(targetGroupId) > 0
+        ? { status: userId === Number(targetGroupId) ? 'creator' : 'member' }
+        : await ctx.telegram.getChatMember(targetGroupId, userId);
       if (member.status !== 'creator' && member.status !== 'administrator') {
         logger.info(`Contact card in General from a non-admin (user ${userId}, ${member.status}) — ignored`);
         return;

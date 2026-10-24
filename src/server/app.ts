@@ -7,6 +7,8 @@ import { DIR, OPCODES } from '../max/opcodes.js';
 import { dialogParticipantIds, extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
 import { SessionStore } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
+import { BridgeDatabase } from '../store/bridgeDatabase.js';
+import { currentDelivery, type DeliveryQueue } from '../bridge/deliveryQueue.js';
 import { SettingsStore } from '../store/settingsStore.js';
 import { DEFAULT_HISTORY_DAYS } from '../bridge/history.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
@@ -20,6 +22,10 @@ import { createLogger } from '../logger.js';
 import { config } from './config.js';
 import { MaxSessionController } from './maxSession.js';
 import { getTelegramProxyAgent, initTelegramProxy } from '../telegram/proxy.js';
+import { assertSupportedRuntime } from './runtime.js';
+import { installGroupDiscovery } from '../telegram/groupDiscovery.js';
+
+assertSupportedRuntime();
 
 const logger = createLogger('server');
 
@@ -49,11 +55,15 @@ process.on('uncaughtException', (err) => {
 });
 
 const sessionStore = new SessionStore();
-const chatMapStore = new ChatMapStore();
+const destinationDir = path.join(process.cwd(), '.data', `telegram-${config.targetTelegramGroup || 'unconfigured'}`);
+const chatMapStore = new ChatMapStore(path.join(destinationDir, 'chat-map.json'));
+const database = config.telegramEnabled ? new BridgeDatabase(path.join(destinationDir, 'bridge.sqlite')) : undefined;
+process.once('exit', () => database?.close());
 const settingsStore = new SettingsStore();
 const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 
 let bot: Telegraf | null = null;
+let deliveryQueue: DeliveryQueue | undefined;
 let chatSync: ChatCatchUp | null = null;
 // «📜 Сколько истории перенести?» (sync.ts) — asked before a sync that fills every chat from scratch.
 let askHistoryDepth: (() => Promise<number>) | null = null;
@@ -76,7 +86,17 @@ const maxSession = new MaxSessionController({
   store: sessionStore,
   onLogin: async (payload) => {
     applyLoginPayload(payload);
+    if (myAccountId != null && database) {
+      try { database.bindAccount(String(myAccountId)); }
+      catch (error) {
+        max.disconnect();
+        await bot?.telegram.sendMessage(config.targetTelegramGroup, '⛔ Сохранённые данные принадлежат другому MAX-аккаунту. Автоматическая перепривязка остановлена; используйте отдельный каталог данных.');
+        throw error;
+      }
+    }
     await refreshChatsAndNames();
+    deliveryQueue?.wake();
+    await deliveryQueue?.drain();
     void syncChatsIfPossible();
   },
   postReauthNotice: (text) => (bot ? bot.telegram.sendMessage(config.targetTelegramGroup, text, maxLoginKeyboard()) : Promise.resolve()),
@@ -362,6 +382,7 @@ async function startServer(): Promise<void> {
       // process.exitCode = 1 and console.error()s the raw update — with a /login DM step in it,
       // an SMS code or the 2FA password. Log the update TYPE only.
       bot.catch((err, ctx) => {
+        if (currentDelivery()) throw err; // the disk queue, not the polling loop, owns this failure
         // The 90 s handlerTimeout only stops waiting: the handler (a big upload, a /login step's
         // chat refresh) keeps running and usually succeeds — no false error notice.
         if ((err as Error)?.name === 'TimeoutError') {
@@ -380,11 +401,16 @@ async function startServer(): Promise<void> {
         );
         void reportError({ kind: 'internal', step: 'telegram-handler', error: err });
       });
-      ({ chatSync, askHistoryDepth, historyQuestionDue } = wireBridge({
+      installGroupDiscovery(bot, config.telegramOwnerId, config.targetTelegramGroup, async candidate => {
+        await writeFile(path.join(process.cwd(), '.data', 'group-candidate.json'), JSON.stringify(candidate), { mode: 0o600 });
+      });
+      ({ chatSync, askHistoryDepth, historyQuestionDue, deliveryQueue } = wireBridge({
         max,
         bot,
         chatMapStore,
         targetGroupId: config.targetTelegramGroup,
+        ownerUserId: config.telegramOwnerId,
+        database,
         getChats: () => cachedChats,
         getMyAccountId: () => myAccountId,
         getContactProfiles: () => contactProfiles,
@@ -439,6 +465,7 @@ async function startServer(): Promise<void> {
       // bot may not have launched (bad token, mid-retry) — nothing to stop
     }
     maxSession.shutdown();
+    deliveryQueue?.stop();
     // Let in-flight work (a mid-write store persist, the polling loop's teardown)
     // drain naturally; the timer is the failsafe so a lingering keep-alive socket
     // or maintenance interval can't hold the process past docker's stop timeout.
@@ -487,6 +514,7 @@ function buildBotDescription(): string {
 // has the full reference — these are just enough to jog the memory from the menu.
 const BOT_COMMANDS = [
   { command: 'panel', description: '🎛 Пульт управления (меню с кнопками)' },
+  { command: 'saved', description: '⭐ Открыть Избранное MAX' },
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
   { command: 'login', description: 'Войти в MAX (номер + SMS, в личке бота)' },
@@ -497,6 +525,13 @@ const BOT_COMMANDS = [
   { command: 'broadcast', description: 'Трансляция чата в группы и каналы Telegram (в теме)' },
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
   { command: 'delete', description: 'Удалить сообщение с обеих сторон (ответом)' },
+  { command: 'read', description: 'Отметить прочитанным в MAX (ответом или в теме)' },
+  { command: 'pin', description: 'Закрепить сообщение в MAX (ответом)' },
+  { command: 'unpin', description: 'Снять закрепление в MAX (в теме)' },
+  { command: 'queue', description: 'Состояние сохранённых заданий доставки' },
+  { command: 'retryincoming', description: 'Разрешить входящий повтор после ручной сверки' },
+  { command: 'retry', description: 'Повторить/проверить задание: /retry НОМЕР' },
+  { command: 'canceljob', description: 'Остановить сохранённое задание с подтверждением' },
   { command: 'newgroup', description: 'Создать группу в MAX: /newgroup <название>' },
   { command: 'invite', description: 'Пригласить в группу: /invite <MAX ID>' },
   { command: 'kick', description: 'Удалить из группы: /kick <MAX ID>' },
@@ -530,7 +565,7 @@ async function reportIfJustUpdated(bot: Telegraf): Promise<void> {
   await bot.telegram.sendMessage(config.targetTelegramGroup, `✅ Обновлено до v${getAppVersion()}.`).catch((err) => logger.error('Failed to send post-update notice', err));
 }
 
-const WELCOME_SENT_MARKER = path.join(process.cwd(), '.data', 'welcome-sent');
+const WELCOME_SENT_MARKER = path.join(destinationDir, 'welcome-sent');
 
 /**
  * On launch, verify the bot can actually reach the configured group and give the
@@ -545,6 +580,13 @@ async function announceGroupReadyOnce(bot: Telegraf): Promise<void> {
   const groupId = config.targetTelegramGroup;
   try {
     await bot.telegram.getChat(groupId);
+    if (config.telegramChatMode === 'private') {
+      const me = await bot.telegram.getMe();
+      if (!(me as unknown as { has_topics_enabled?: boolean }).has_topics_enabled) {
+        await bot.telegram.sendMessage(groupId, '⚙️ Для чатов MAX включите темы в личке бота: BotFather → настройки бота → Forum/Topics mode. После включения перезапустите мост.');
+        return;
+      }
+    }
   } catch (err) {
     logger.error(
       `Не удаётся получить доступ к Telegram-группе ${groupId}. Проверьте, что бот добавлен в неё администратором с правом «Управление темами». Пока это не исправлено, мост не сможет пересылать сообщения.`,
@@ -561,7 +603,7 @@ async function announceGroupReadyOnce(bot: Telegraf): Promise<void> {
   try {
     await bot.telegram.sendMessage(
       groupId,
-      '✅ Telemax подключён к этой группе.\n\nЕсли ещё не вошли в MAX — нажмите «🔐 Войти в MAX» и авторизуйтесь в личке бота (номер + код из SMS), или напишите боту в личку /login. Полный список команд — /help.',
+      '✅ Telemax подключён.\n\nЕсли ещё не вошли в MAX — нажмите «🔐 Войти в MAX» или отправьте /login. Полный список команд — /help.',
       maxLoginKeyboard(),
     );
     await writeFile(WELCOME_SENT_MARKER, new Date().toISOString(), 'utf8').catch(() => {});
@@ -625,6 +667,7 @@ function watchPolling(bot_: Telegraf): void {
 
 /** Ends the process for Docker (restart: unless-stopped) to start it again — the panel's «Перезапустить» and the watchdog's last resort. */
 function exitForRestart(code: number): void {
+  deliveryQueue?.stop();
   try {
     maxSession.shutdown();
   } catch {

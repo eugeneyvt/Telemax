@@ -555,6 +555,8 @@ if [ -f .env ]; then
     # Re-read on every call so the menu always shows what's actually in .env.
     TELEGRAM_BOT_TOKEN=$(env_read TELEGRAM_BOT_TOKEN)
     TARGET_TELEGRAM_GROUP=$(env_read TARGET_TELEGRAM_GROUP)
+    TELEGRAM_CHAT_MODE=$(env_read TELEGRAM_CHAT_MODE)
+    TELEGRAM_OWNER_ID=$(env_read TELEGRAM_OWNER_ID)
     TELEGRAM_PROXY=$(env_read TELEGRAM_PROXY)
     STICKERS=$(env_read STICKERS)
     MAX_SESSION_KEY=$(env_read MAX_SESSION_KEY)
@@ -566,6 +568,7 @@ if [ -f .env ]; then
     bold "=== Telemax — текущие настройки ==="
     echo "  Контейнер:        $container"
     echo "  Токен бота:       $(mask_token "${TELEGRAM_BOT_TOKEN:-}")"
+    echo "  Режим Telegram:  ${TELEGRAM_CHAT_MODE:-group}; владелец: ${TELEGRAM_OWNER_ID:-не задан}"
     echo "  Группа Telegram:  ${TARGET_TELEGRAM_GROUP:-не задана}"
     if [ -n "${TELEGRAM_PROXY:-}" ]; then
       echo "  Прокси Telegram:  $(redact_proxy "$TELEGRAM_PROXY")"
@@ -666,6 +669,7 @@ if [ -f .env ]; then
       echo "Добавьте бота в нужную группу администратором (право «Управление темами») и напишите в неё любое сообщение."
       read -rp "Готово? Enter... "
       detect_group
+      set_env_var TELEGRAM_CHAT_MODE group
     fi
     [ "$token_changed" = "1" ] && set_env_var TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
     set_env_var TARGET_TELEGRAM_GROUP "$TARGET_TELEGRAM_GROUP"
@@ -846,6 +850,13 @@ until [ -n "$TELEGRAM_BOT_TOKEN" ] && verify_bot_token; do
   read -rp "Токен бота (TELEGRAM_BOT_TOKEN): " TELEGRAM_BOT_TOKEN
 done
 
+TELEGRAM_CHAT_MODE=private
+TELEGRAM_OWNER_ID=""
+TARGET_TELEGRAM_GROUP=""
+echo
+read -rp "Где общаться: 1 — темы в личке бота (по умолчанию), 2 — группа: " CHAT_MODE_CHOICE
+if [ "${CHAT_MODE_CHOICE:-1}" = "2" ]; then
+  TELEGRAM_CHAT_MODE=group
 echo
 bold "Теперь группа:"
 echo "  1. Создайте Telegram-группу (или возьмите существующую) и включите в ней Темы:"
@@ -872,6 +883,18 @@ if [ -f "$AVATAR" ]; then
     echo "Не удалось установить аватарку группы (не критично, можно поставить вручную)."
   fi
 fi
+
+else
+  echo "Включите Forum/Topics mode в настройках вашего бота у BotFather."
+  echo "Отправьте боту /start. Укажите числовой Telegram ID своего аккаунта:"
+  echo "доступ к мосту получит только этот аккаунт; автоматического выбора владельца нет."
+fi
+# Both destination modes enforce the same explicit Telegram owner.
+while :; do
+  read -rp "Ваш Telegram ID (владелец моста): " TELEGRAM_OWNER_ID
+  [[ "$TELEGRAM_OWNER_ID" =~ ^[1-9][0-9]*$ ]] && break
+  echo "Нужен положительный числовой ID аккаунта Telegram."
+done
 
 MAX_SESSION_KEY=$(openssl rand -hex 32)
 
@@ -936,6 +959,8 @@ cat > .env <<EOF
 COMPOSE_PROJECT_NAME=$(env_quote "$(unique_compose_name)")
 MAX_SESSION_KEY=$(env_quote "$MAX_SESSION_KEY")
 TELEGRAM_BOT_TOKEN=$(env_quote "$TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_MODE=$(env_quote "$TELEGRAM_CHAT_MODE")
+TELEGRAM_OWNER_ID=$(env_quote "$TELEGRAM_OWNER_ID")
 TARGET_TELEGRAM_GROUP=$(env_quote "$TARGET_TELEGRAM_GROUP")
 TELEGRAM_PROXY=$(env_quote "$TELEGRAM_PROXY")
 STICKERS=$(env_quote "$STICKERS")

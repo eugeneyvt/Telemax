@@ -26,6 +26,7 @@ const NETWORK_CODES = new Set([
   'EHOSTUNREACH',
   'ENETUNREACH',
   'ENETDOWN',
+  'EADDRNOTAVAIL',
   'ERR_SOCKET_CLOSED',
   'ERR_STREAM_DESTROYED',
   'ERR_STREAM_WRITE_AFTER_END',
@@ -72,6 +73,10 @@ const RIGHTS_REFUSAL = /not enough rights|CHAT_WRITE_FORBIDDEN|have no rights|bo
  * outlasts it still means "not now", not "never".
  */
 export function isTransientTelegramError(err: unknown): boolean {
+  if (err instanceof Error && err.name === 'IncomingDeliveryUncertainError') return true;
+  // A local checkpoint failure must never advance history past an uncommitted binding.
+  const localCode = (err as { code?: string } | null)?.code;
+  if (localCode && ['ERR_SQLITE_ERROR', 'ERR_SQLITE_BUSY', 'ENOSPC', 'EDQUOT', 'EROFS', 'EIO'].includes(localCode)) return true;
   const response = (err as { response?: unknown } | null | undefined)?.response;
   if (response && typeof response === 'object' && (response as { error_code?: unknown }).error_code != null) {
     const { error_code, description } = response as { error_code?: unknown; description?: unknown };
@@ -129,7 +134,7 @@ export class MaxUnavailableError extends Error {
   }
 }
 
-const CONNECT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN']);
+const CONNECT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'EADDRNOTAVAIL']);
 
 /** The connection itself failed (refused, unreachable, no DNS answer, connect timeout): no byte of the request left. */
 export function isConnectFailure(err: unknown, depth = 0): boolean {

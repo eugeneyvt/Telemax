@@ -5,6 +5,7 @@ import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
 import { reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
 import { maskPhone } from '../bridge/status.js';
 import { createLogger } from '../logger.js';
+import { MaxPasswordSetupRequiredError } from '../max/authErrors.js';
 
 const logger = createLogger('max-session');
 
@@ -332,7 +333,16 @@ export class MaxSessionController {
 
   async verifyCode(code: string): Promise<{ ok: true } | { passwordRequired: true; hint: string | null }> {
     if (!this.pendingAuthToken) throw new MaxAuthUnavailableError('Код уже использован или устарел — начните заново: /login');
-    const verified = await this.deps.client.verifyCode(this.pendingAuthToken, code);
+    let verified: VerifyCodeResult;
+    try { verified = await this.deps.client.verifyCode(this.pendingAuthToken, code); }
+    catch (error) {
+      if (error instanceof MaxPasswordSetupRequiredError) {
+        this.pendingAuthToken = null;
+        this.pendingPasswordTrackId = null;
+        this.authChainStartedAt = null;
+      }
+      throw error;
+    }
     if (verified.status === 'password_required') {
       this.pendingPasswordTrackId = verified.challenge.trackId;
       return { passwordRequired: true, hint: verified.challenge.hint ?? null };

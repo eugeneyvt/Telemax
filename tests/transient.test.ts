@@ -21,6 +21,9 @@ function withCode(message: string, code: string, name = 'Error'): Error {
 }
 
 describe('isTransientTelegramError', () => {
+  it('keeps a history cursor before messages whose local checkpoint could not be committed', () => {
+    for (const code of ['ERR_SQLITE_ERROR', 'ENOSPC', 'EDQUOT', 'EROFS', 'EIO']) expect(isTransientTelegramError(withCode('checkpoint failed', code))).toBe(true);
+  });
   it('treats 5xx and an outlasting 429 as transient', () => {
     expect(isTransientTelegramError(telegramError(500))).toBe(true);
     expect(isTransientTelegramError(telegramError(502, 'Bad Gateway'))).toBe(true);
@@ -157,6 +160,7 @@ describe('isConnectFailure', () => {
     const wrapped = (code: string) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('x'), { code }) });
     expect(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'EHOSTUNREACH'].map((c) => isConnectFailure(wrapped(c)))).toEqual([true, true, true, true, true]);
     expect(isConnectFailure(wrapped('ECONNRESET'))).toBe(false);
+    expect(isConnectFailure(wrapped('EADDRNOTAVAIL'))).toBe(true);
     expect(isConnectFailure(wrapped('UND_ERR_SOCKET'))).toBe(false);
     expect(isConnectFailure(new Error('fetch failed'))).toBe(false);
   });

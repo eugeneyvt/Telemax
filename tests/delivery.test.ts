@@ -131,11 +131,11 @@ describe('linkMaxIds', () => {
     expect(linkMaxIds({ maxMessageId: 100n, extraMaxMessageIds: [101n, 102n] })).toEqual([100n, 101n, 102n]);
   });
 
-  it('keeps the further pieces out of the by-MAX index', () => {
+  it('resolves further pieces to the same full link', () => {
     const store = new MessageLinkStore();
     store.add({ maxChatId: 1, maxMessageId: 100n, extraMaxMessageIds: [101n], telegramMessageId: 7, outgoing: true });
     expect(linkMaxIds(store.getByTelegram(7) as { maxMessageId: unknown })).toEqual([100n, 101n]);
-    expect(store.getByMax(1, 101n)).toBeUndefined();
+    expect(store.getByMax(1, 101n)).toBe(store.getByMax(1, 100n));
   });
 
   it('covers() knows every piece, so a catch-up does not post a later piece again', () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Context } from 'telegraf';
 import { createMaxAuthFlow, MaxAuthUnavailableError } from '../src/bridge/maxAuthFlow.js';
+import { MaxPasswordSetupRequiredError } from '../src/max/authErrors.js';
 
 // A refusal about the connection state is shown alone and ends the flow (review 2026-09-26, client-r2#2).
 
@@ -35,6 +36,22 @@ function flowWith(requestSms: (phone: string) => Promise<void>) {
 }
 
 describe('maxAuthFlow — requestSms refusals', () => {
+  it('explains mandatory setup on the existing device, removes the SMS code and ends the code-retry loop', async () => {
+    const verify = vi.fn(async () => { throw new MaxPasswordSetupRequiredError(); });
+    const flow = createMaxAuthFlow({ targetGroupId: '-100', auth: {
+      getLastKnownPhone: () => '', requestSms: async () => {}, verifyCode: verify, checkPassword: async () => {},
+    } });
+    await flow.handlePrivate(fakeCtx({ text: '/login' }).ctx);
+    await flow.handlePrivate(fakeCtx({ text: '+79999999999' }).ctx);
+    const code = fakeCtx({ text: '000000' }); await flow.handlePrivate(code.ctx);
+    expect(code.ctx.deleteMessage).toHaveBeenCalledOnce();
+    expect(code.replies[0]).toContain('Установить пароль');
+    expect(code.replies[0]).toContain('/login заново');
+    expect(code.replies[0]).not.toContain('Пришлите код ещё раз');
+    expect(flow.hasPending(7)).toBe(false);
+    expect(await flow.handlePrivate(fakeCtx({ text: '000000' }).ctx)).toBe(false);
+    expect(verify).toHaveBeenCalledOnce();
+  });
   it('shows a connection-state refusal without «Проверьте номер» and ends the flow', async () => {
     const flow = flowWith(async () => {
       throw new MaxAuthUnavailableError('MAX на паузе — снимите паузу в /panel (▶️ Возобновить MAX) и повторите /login.');

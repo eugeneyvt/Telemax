@@ -7,6 +7,8 @@ import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { MAX_TLS_CA } from './ca.js';
 import { toMaxReaction } from './reactions.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
+import type { MaxTextElement } from '../bridge/formatting.js';
+import { MaxPasswordSetupRequiredError, requiresPasswordSetup } from './authErrors.js';
 
 export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
 
@@ -86,11 +88,12 @@ export interface MaxHistoryMessage {
   sender?: unknown;
   cid?: number;
   text?: string;
+  elements?: MaxTextElement[];
   attaches?: unknown[];
   status?: string;
   reactions?: unknown;
   // A forward — same shape as PUSH_MESSAGE's link field (see bridge/sync.ts MaxPushPayload).
-  link?: { type?: string; message?: { id?: unknown; text?: string; sender?: unknown; attaches?: unknown[] }; chatId?: unknown };
+  link?: { type?: string; message?: { id?: unknown; text?: string; elements?: MaxTextElement[]; sender?: unknown; attaches?: unknown[] }; chatId?: unknown };
 }
 
 // The port, the INIT user agent and the ping interval are fixed (constants below), and the
@@ -183,6 +186,15 @@ export class MaxConnectionLostError extends Error {
     this.name = 'MaxConnectionLostError';
   }
 }
+
+/** Bytes may have left the process. A caller must reconcile rather than blindly send again. */
+export class MaxRequestOutcomeUnknownError extends MaxConnectionLostError {
+  constructor(readonly opcode: number, cause?: unknown) {
+    super(`outcome of ${formatOpcode(opcode)} (unknown)`, cause instanceof MaxConnectionLostError ? cause.cause ?? cause : cause);
+    this.name = 'MaxRequestOutcomeUnknownError';
+  }
+}
+export interface MaxSendOptions { cid?: number; elements?: MaxTextElement[] }
 
 /**
  * True when an EVENTS push says the upload with this id is processed: `{videoId}` for video,
@@ -596,7 +608,7 @@ export class MaxClient extends EventEmitter {
    * per opcode is in flight, which request() enforces (hence private).
    */
   private waitForOpcode(opcode: number, timeoutMs = 20_000): { promise: Promise<MaxMessageEvent>; fail: (err: Error) => void } {
-    return this.addWait(opcode, formatOpcode(opcode), () => true, timeoutMs, `Timed out waiting for ${formatOpcode(opcode)}`);
+    return this.addWait(opcode, formatOpcode(opcode), event => event.dir === DIR.OK || event.dir === DIR.ERR, timeoutMs, `Timed out waiting for ${formatOpcode(opcode)}`);
   }
 
   // Tail of the in-flight request chain per opcode — see request() below.
@@ -618,9 +630,8 @@ export class MaxClient extends EventEmitter {
    * response landed first (a real race: Telegraf handles a poll batch's updates concurrently, and
    * two quick messages cross-wired the messageId links). Different opcodes still run in parallel.
    *
-   * Known residual gap: if a request times out and its response arrives late, the NEXT same-opcode
-   * request may consume that stale frame — unavoidable without seq correlation, and a timeout
-   * usually means the connection is about to be torn down anyway.
+   * After a response timeout the socket is destroyed before the next request starts.
+   * Late frames from that socket cannot settle a later same-opcode request.
    *
    * Without a socket, send() throws and the wait is withdrawn on the spot: the call rejects with
    * "not connected" and leaves no timer behind (an orphaned wait timed out 20 s later as an
@@ -628,15 +639,30 @@ export class MaxClient extends EventEmitter {
    */
   private request(opcode: number, payload?: unknown, timeoutMs?: number): Promise<MaxMessageEvent> {
     const prev = this.requestChains.get(opcode) ?? Promise.resolve();
-    const run = prev.then(() => {
+    const run = prev.then(async () => {
       // Registered before send() so the answer cannot slip past; withdrawn if send() throws.
       const wait = this.waitForOpcode(opcode, timeoutMs);
+      let sent = false;
       try {
         this.send(opcode, payload);
+        sent = true;
       } catch (err) {
         wait.fail(err instanceof Error ? err : new Error(String(err)));
       }
-      return wait.promise;
+      try { return await wait.promise; }
+      catch (error) {
+        if (sent && /Timed out waiting for/.test((error as Error).message)) {
+          // No further response on this socket may be consumed by a later same-opcode request.
+          this.teardownSocket();
+          this.authed = false;
+          this.emit('disconnected');
+          if (!this.closedByUser && this.opts.reconnect) this.scheduleReconnect();
+        }
+        if (sent && [OPCODES.MSG_SEND, OPCODES.MSG_EDIT, OPCODES.MSG_DELETE, OPCODES.MSG_REACTION, OPCODES.MSG_CANCEL_REACTION, OPCODES.SEND_VOTE, OPCODES.CHAT_SET_INFO, OPCODES.CHAT_MARK].includes(opcode as never)) {
+          throw new MaxRequestOutcomeUnknownError(opcode, error);
+        }
+        throw error;
+      }
     });
     // Keep the chain alive on failure so the next request still runs.
     this.requestChains.set(opcode, run.catch(() => undefined));
@@ -667,6 +693,7 @@ export class MaxClient extends EventEmitter {
     if (challenge) {
       return { status: 'password_required', challenge };
     }
+    if (requiresPasswordSetup(payload)) throw new MaxPasswordSetupRequiredError();
     // No login token AND no password challenge: a wrong/stale code, or a number not registered in
     // MAX yet (its REGISTRATION flow returns no login token) — spell out both.
     throw new Error(
@@ -727,18 +754,20 @@ export class MaxClient extends EventEmitter {
     text: string | null,
     attaches: unknown[] = [],
     replyTo?: { messageId: unknown; chatId: unknown },
+    options: MaxSendOptions = {},
   ): Promise<{ cid: number; messageId: unknown; attaches: unknown[]; time: unknown }> {
-    const cid = this.nextCid();
+    const cid = options.cid ?? this.nextCid();
     // The OUTGOING reply link is {type, messageId, chatId}; the INCOMING one carries `message`
     // instead (two shapes, confirmed 2026-08-16). messageId is the quoted message's BigInt id.
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       chatId: toChatId(chatId),
-      message: { text, cid: BigInt(cid), elements: [], attaches, link },
+      message: { text, cid: BigInt(cid), elements: options.elements ?? [], attaches, link },
       notify: true,
     });
     const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null)?.message;
-    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_SEND failed'));
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MSG_SEND failed'), OPCODES.MSG_SEND);
+    if (responseMessage?.id == null) throw new MaxRequestOutcomeUnknownError(OPCODES.MSG_SEND);
     // `time` is the echoed message's MAX server timestamp, raw — the chat's history cursor (liveCursorTime).
     return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [], time: responseMessage?.time };
   }
@@ -754,17 +783,18 @@ export class MaxClient extends EventEmitter {
     text: string,
     attaches: unknown[] = [],
     replyTo?: { messageId: unknown; chatId: unknown },
+    options: MaxSendOptions = {},
   ): Promise<{ cid: number; messageId: unknown; chatId: unknown; attaches: unknown[]; time: unknown }> {
-    const cid = this.nextCid();
+    const cid = options.cid ?? this.nextCid();
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       userId: toUserId(userId),
-      message: { text, cid: BigInt(cid), elements: [], attaches, link },
+      message: { text, cid: BigInt(cid), elements: options.elements ?? [], attaches, link },
       notify: true,
     });
-    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'Open-dialog send failed'));
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'Open-dialog send failed'), OPCODES.MSG_SEND);
     const p = payload as { chatId?: unknown; message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null;
-    if (p?.chatId == null) throw new Error('Open-dialog send did not return a chat id');
+    if (p?.chatId == null || p.message?.id == null) throw new MaxRequestOutcomeUnknownError(OPCODES.MSG_SEND);
     return { cid, messageId: p.message?.id, chatId: p.chatId, attaches: p.message?.attaches ?? [], time: p.message?.time };
   }
 
@@ -775,9 +805,27 @@ export class MaxClient extends EventEmitter {
   }
 
   /** `messageId` must be the genuine MAX integer id (BigInt) — see opcodes.ts for the type pitfall across these three calls. */
-  async editMessage(chatId: unknown, messageId: unknown, text: string): Promise<void> {
-    const { dir, payload } = await this.request(OPCODES.MSG_EDIT, { chatId: toChatId(chatId), messageId, text, elements: [], attachments: [] });
+  async editMessage(chatId: unknown, messageId: unknown, text: string, elements: MaxTextElement[] = []): Promise<void> {
+    const { dir, payload } = await this.request(OPCODES.MSG_EDIT, { chatId: toChatId(chatId), messageId, text, elements, attachments: [] });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_EDIT failed'));
+  }
+
+  async getMessages(chatId: unknown, messageIds: unknown[]): Promise<MaxHistoryMessage[]> {
+    const { dir, payload } = await this.request(OPCODES.MSG_GET, { chatId: toChatId(chatId), messageIds: messageIds.map(id => BigInt(String(id))) });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'MSG_GET failed'), OPCODES.MSG_GET);
+    return (payload as { messages?: MaxHistoryMessage[] } | null)?.messages ?? [];
+  }
+
+  async markRead(chatId: unknown, messageId: unknown): Promise<void> {
+    const message = (await this.getMessages(chatId, [messageId]))[0];
+    if (message == null || !Number.isFinite(Number(message.time))) throw new Error('Не удалось получить время выбранного сообщения MAX.');
+    const { dir, payload } = await this.request(OPCODES.CHAT_MARK, { type: 'READ_MESSAGE', chatId: toChatId(chatId), messageId: BigInt(String(messageId)), mark: BigInt(message.time) });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'CHAT_MARK failed'), OPCODES.CHAT_MARK);
+  }
+
+  async pinMessage(chatId: unknown, messageId: unknown | null, notify = false): Promise<void> {
+    const { dir, payload } = await this.request(OPCODES.CHAT_SET_INFO, { chatId: toChatId(chatId), pinMessageId: messageId == null ? 0n : BigInt(String(messageId)), notifyPin: notify });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'Pin message failed'), OPCODES.CHAT_SET_INFO);
   }
 
   /**
@@ -1052,8 +1100,8 @@ export class MaxClient extends EventEmitter {
   }
 
   /** Requests an upload slot for a single video. */
-  async requestVideoUpload(): Promise<{ url: string; videoId: unknown; token: string }> {
-    const { dir, payload } = await this.request(OPCODES.VIDEO_UPLOAD, { count: 1, type: 0, uploaderType: 0, profile: false });
+  async requestVideoUpload(round = false): Promise<{ url: string; videoId: unknown; token: string }> {
+    const { dir, payload } = await this.request(OPCODES.VIDEO_UPLOAD, { count: 1, type: round ? 1 : 0, uploaderType: round ? 1 : 0, profile: false });
     const slot = (payload as { info?: Array<{ url: string; videoId: unknown; token: string }> } | null)?.info?.[0];
     if (dir === DIR.ERR || !slot) {
       throw new Error(describeAuthError(payload, 'VIDEO_UPLOAD did not return an upload slot'));

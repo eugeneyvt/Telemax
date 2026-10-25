@@ -80,14 +80,16 @@ async function setup() {
 describe('dedicated MAX bot provisioning', () => {
   it('offers an owner-confirmed Telegram creation button with a unique username', async () => {
     const h = await setup(); const r = await h.request();
-    const prompt = h.calls.find(c => c.payload.reply_markup?.keyboard);
-    expect(prompt?.payload.chat_id).toBe(42); expect(prompt?.payload.reply_markup.keyboard[0][0].request_managed_bot.suggested_name).toBe('Метка контакта · MAX');
+    const prompt = h.calls.find(c => c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.url?.includes('/newbot/'));
+    expect(prompt?.payload.chat_id).toBe(42);
+    const url = new URL(prompt!.payload.reply_markup.inline_keyboard[0][0].url);
+    expect(url.pathname).toBe(`/newbot/root_bot/${r.username}`); expect(url.searchParams.get('name')).toBe('Метка контакта · MAX');
     expect(r.username).toMatch(/^mx_[a-f0-9]{20}_bot$/); expect(manager!.records()).toHaveLength(0);
   });
   it('rejects outsiders and handles a disabled management capability without pretending to create a bot', async () => {
     const h = await setup(); await h.bot.handleUpdate(msg(1, '/bot', 99)); expect(db.values('dedicatedRequests')).toHaveLength(0);
     h.enable(false); await h.request(); expect(h.calls.some(c => c.payload.text?.includes('@BotFather'))).toBe(true);
-    expect(h.calls.some(c => c.payload.reply_markup?.keyboard)).toBe(false);
+    expect(h.calls.some(c => c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.url?.includes('/newbot/'))).toBe(false);
   });
   it('saves managed events before returning the Telegram polling batch', async () => {
     const h = await setup(); await h.request(); manager!.installInbox();
@@ -107,6 +109,14 @@ describe('dedicated MAX bot provisioning', () => {
     expect(h.calls.some(c => c.method === 'setManagedBotAccessSettings' && c.payload.is_access_restricted === true && c.payload.added_user_ids.length === 0)).toBe(true);
     expect(manager!.manages('55')).toBe(false); expect((await h.map.getByMaxChatId('55'))?.dedicatedBotId).toBeUndefined();
     expect(h.previousChat).not.toHaveBeenCalled();
+  });
+  it('rolls token and binding back together if committing the pairing fails', async () => {
+    const h = await setup(); await h.request(); await h.candidate();
+    const set = db.set.bind(db);
+    const fault = vi.spyOn(db, 'set').mockImplementation((kind, key, value) => { if (kind === 'dedicatedBots') throw new Error('Disk full'); set(kind, key, value); });
+    await h.bind(); expect(db.values('dedicatedTokens')).toHaveLength(0); expect(manager!.records()).toHaveLength(0);
+    expect(db.values('dedicatedManagementInbox')).toHaveLength(1);
+    fault.mockRestore(); await manager!.tick(); expect(manager!.records()).toHaveLength(1); expect(db.values('dedicatedTokens')).toHaveLength(1);
   });
   it('freezes the old destination only after the owner starts the new bot and copies its cursor', async () => {
     const h = await setup(); await h.request(); await h.candidate(); await h.bind(); (h.max as any).isLoggedIn = true;

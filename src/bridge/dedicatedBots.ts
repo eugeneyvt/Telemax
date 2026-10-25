@@ -87,7 +87,7 @@ export class DedicatedBots {
       await this.tell('Включите управление другими ботами у @BotFather для основного бота, затем повторите /bot в теме контакта.'); return;
     }
     await this.tell(`Создать отдельную личку «${standaloneTitle(r.title)}»? Telegram попросит подтвердить имя и username. После создания я предложу привязку к этому MAX-чату.`, {
-      keyboard: [[{ text: `Создать: ${r.title.slice(0, 40)}`, request_managed_bot: { request_id: Number.parseInt(r.code.slice(0, 7), 16), suggested_name: standaloneTitle(r.title).slice(0, 64), suggested_username: r.username } }]], resize_keyboard: true, one_time_keyboard: true,
+      inline_keyboard: [[{ text: `Создать «${standaloneTitle(r.title).slice(0, 44)}»`, url: `https://t.me/newbot/${me.username}/${r.username}?name=${encodeURIComponent(standaloneTitle(r.title).slice(0, 64))}` }]],
     });
   }
   private tell(text: string, reply_markup?: unknown): Promise<any> {
@@ -122,6 +122,7 @@ export class DedicatedBots {
       try {
         if (!this.runtimes.has(record.maxChatId)) await this.open(record);
         const runtime = this.runtimes.get(record.maxChatId)!;
+        if (record.state === 'waiting-start') await this.boundNotice(record);
         if (runtime.db.get('dedicatedLifecycle', 'started') && record.state !== 'active') await this.activate(record);
         if (this.byMax(record.maxChatId)?.state === 'active' && this.options.max.isLoggedIn) await this.identity(this.byMax(record.maxChatId)!);
       } catch { logger.warn('Dedicated bot activation or identity remains pending'); }
@@ -162,23 +163,36 @@ export class DedicatedBots {
     const request = this.db.get<Request>('dedicatedRequests', bind[1]!), candidate = this.db.get<Candidate>('dedicatedCandidates', bind[2]!);
     if (!request || expired(request) || !candidate) return;
     const existing = this.byMax(request.maxChatId);
-    if (existing) return;
+    if (existing) {
+      if (existing.botId === candidate.botId) {
+        if (!this.runtimes.has(existing.maxChatId)) await this.open(existing);
+        await this.boundNotice(existing);
+      }
+      return;
+    }
     if (this.records().some(r => r.botId === candidate.botId)) throw new Error('Bot is already assigned to another MAX chat');
     const mapping = await this.options.chatMapStore.getByMaxChatId(request.maxChatId);
     if (!mapping || mapping.banned || mapping.pendingUserId) return;
     const record: DedicatedBot = { maxChatId: request.maxChatId, botId: candidate.botId, username: candidate.username, title: request.title, created: Date.now(), state: 'waiting-start' };
-    await this.storeToken(record);
-    this.db.set('dedicatedBots', record.maxChatId, record);
+    await this.storeToken(record, true);
     await this.open(record);
+    await this.boundNotice(record);
+  }
+  private async boundNotice(record: DedicatedBot): Promise<void> {
+    if (this.db.get('dedicatedNotices', `bound:${record.botId}`)) return;
     this.db.set('dedicatedNotices', `bound:${record.botId}`, true);
     await this.tell(`«${record.title}» привязан к @${record.username}. Откройте его и нажмите Start.`, { inline_keyboard: [[{ text: 'Открыть отдельный чат', url: `https://t.me/${record.username}?start=bridge` }]] });
   }
-  private async storeToken(record: DedicatedBot): Promise<void> {
+  private async storeToken(record: DedicatedBot, newBinding = false): Promise<void> {
     const token = await api(this.options.bot, 'getManagedBotToken', { user_id: record.botId });
     const bot = this.deps.createBot(token), me = await bot.telegram.getMe();
     if (me.id !== record.botId || !me.is_bot || me.id === this.options.bot.botInfo?.id) throw new Error('Managed bot identity mismatch');
     await api(this.options.bot, 'setManagedBotAccessSettings', { user_id: record.botId, is_access_restricted: true, added_user_ids: [] });
-    this.db.set('dedicatedTokens', String(record.botId), sealDedicatedToken(token, record.botId, record.maxChatId));
+    const sealed = sealDedicatedToken(token, record.botId, record.maxChatId);
+    this.db.transaction(() => {
+      this.db.set('dedicatedTokens', String(record.botId), sealed);
+      if (newBinding) this.db.set('dedicatedBots', record.maxChatId, record);
+    });
   }
   private async open(record: DedicatedBot): Promise<void> {
     const sealed = this.db.get<ReturnType<typeof sealDedicatedToken>>('dedicatedTokens', String(record.botId)); if (!sealed) throw new Error('Managed token missing');

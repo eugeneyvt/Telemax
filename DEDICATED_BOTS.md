@@ -2,8 +2,8 @@
 
 `/bots` in the primary control group or main bot DM lists dedicated chats and offers a contact
 picker. `/bot` in an existing MAX topic (or its separate plain group) selects that chat directly.
-The main bot sends its owner a Telegram `request_managed_bot` button with a unique suggested
-username and the MAX contact label. Enable Bot Management in @BotFather for the main bot first.
+The main bot sends its owner an inline creation button with a unique suggested
+username and the MAX contact label, using Telegram's official `t.me/newbot` deep link. Enable Bot Management in @BotFather for the main bot first.
 
 Telegram requires the owner to confirm creation. A `managed_bot` update or `managed_bot_created`
 service message is persisted before polling acknowledgement. The owner then explicitly confirms
@@ -55,7 +55,7 @@ authorized user session and a live proof; it does not provide read control for a
 whose recipient is a bot. This design is not enabled or presented as verified by this release.
 
 Sources: [managed bots](https://core.telegram.org/api/bots/managed-bots),
-[creation button](https://core.telegram.org/bots/api#keyboardbuttonrequestmanagedbot),
+[creation link](https://core.telegram.org/api/links#managed-bot-creation-links),
 [profile photo](https://core.telegram.org/bots/api#setmyprofilephoto),
 [readHistory](https://core.telegram.org/method/messages.readHistory),
 [readBusinessMessage](https://core.telegram.org/bots/api#readbusinessmessage).

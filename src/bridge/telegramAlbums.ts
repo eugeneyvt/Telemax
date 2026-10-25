@@ -18,24 +18,25 @@ export interface AlbumMessage {
   audio?: { file_id: string; file_unique_id?: string; file_size?: number; file_name?: string };
   reply_to_message?: { message_id: number };
 }
-export interface TelegramAlbum { kind: 'telegram-album'; mapping: Mapping; messages: AlbumMessage[]; started?: boolean }
+export interface ReadTarget { chatId: string; messageId: unknown }
+export interface TelegramAlbum { kind: 'telegram-album'; mapping: Mapping; messages: AlbumMessage[]; started?: boolean; readTarget?: ReadTarget }
 export const isTelegramAlbum = (value: unknown): value is TelegramAlbum => (value as TelegramAlbum | null)?.kind === 'telegram-album';
 
 /** Telegram sends no end-of-album event: persist every part, then wait for a quiet interval. */
 export class TelegramAlbums {
   constructor(private readonly db: BridgeDatabase, private readonly destination: string, private readonly quietMs = 2000) {}
-  add(update: Update, mapping: Mapping): DeliveryJob {
+  add(update: Update, mapping: Mapping, readTarget?: ReadTarget): DeliveryJob {
     const updateKey = String(update.update_id);
     const previous = this.db.get<number>('albumUpdates', updateKey);
     if (previous != null) return this.db.job(previous)!;
     const message = (update as { message: AlbumMessage }).message;
     const key = `${this.destination}:album:${mapping.maxChatId}:${mapping.telegramTopicId}:${message.media_group_id}`;
     return this.db.transaction(() => {
-      let job = this.db.enqueue(key, String(mapping.maxChatId), { kind: 'telegram-album', mapping, messages: [] } satisfies TelegramAlbum);
+      let job = this.db.enqueue(key, String(mapping.maxChatId), { kind: 'telegram-album', mapping, messages: [], readTarget } satisfies TelegramAlbum);
       let payload = job.payload as TelegramAlbum;
       // A late part never mutates a started/retried operation and its frozen effect order.
       if (payload.started || job.status !== 'pending') {
-        job = this.db.enqueue(`${key}:late:${update.update_id}`, String(mapping.maxChatId), { kind: 'telegram-album', mapping, messages: [] } satisfies TelegramAlbum);
+        job = this.db.enqueue(`${key}:late:${update.update_id}`, String(mapping.maxChatId), { kind: 'telegram-album', mapping, messages: [], readTarget } satisfies TelegramAlbum);
         payload = job.payload as TelegramAlbum;
       }
       payload = { ...payload, messages: [...payload.messages, message].sort((a, b) => a.message_id - b.message_id) };

@@ -17,7 +17,7 @@ ID and the MAX chat ID. Tokens are never sent in chat or written to public sourc
 
 The owner opens the new bot and presses Start. Until then the original destination continues
 working. Activation pauses new traffic there, waits for existing deliveries and history work to
-settle, and carries the final cursor into `.data/dedicated-bots/<botId>/`. Each bot has its own
+settle, and starts a separate history cursor in `.data/dedicated-bots/<botId>/`. Each bot has its own
 SQLite queue, aliases, checkpoints and durable polling offset; all bots share one MAX connection
 and one global cid allocator. Each distinct Telegram token necessarily has its own poller.
 
@@ -33,7 +33,11 @@ is subject to the account's Telegram bot limit. MAX groups can also be selected,
 represents the whole group; it does not impersonate each individual group participant.
 
 Older messages are retained at their original destination, with original aliases and databases.
-They are not copied or assigned fabricated IDs. A retired plain group no longer accepts new
+The new destination independently backfills MAX history to the configured depth (seven days
+unless changed in the main panel), creating real new Telegram messages and its own aliases.
+Older releases incorrectly inherited the source cursor: startup repairs that cursor once while
+retaining local links and checkpoints, so already delivered messages are skipped after restarts.
+History catch-up runs in the background independently for each bot. A retired plain group no longer accepts new
 traffic. Unresolved deliveries prevent switching; they are not discarded. The primary forum keeps
 the global session controls. Back up all `.data` recursively together with the session key.
 
@@ -42,6 +46,14 @@ the global session controls. Back up all `.data` recursively together with the s
 Automatic read cards have been removed. Startup deletes only previously recorded receipt-card
 message IDs; retries tolerate cards already deleted. Message history, aliases and read metadata
 are retained. `/receipt` remains an explicit, on-demand query and sends nothing automatically.
+
+Telegram Bot API does not report when the owner views a bot's private messages. `/read` explicitly
+marks the chosen incoming MAX message (or the newest delivered copy). The owner's opt-in
+`readOnReply: true` setting also marks already delivered incoming messages after a successful
+outgoing reply, including media/album replies. Its boundary is durably captured before polling
+acknowledgement (at the first album part), so later arrivals are never marked by an earlier reply.
+Commands, edits, reactions, failed sends and history loading do not trigger this policy. Read-mark
+retries retain the boundary and journalled send result, avoiding duplicate outgoing messages.
 
 Normal bot accounts cannot invoke Telegram's `messages.readHistory`, `channels.readHistory` or
 `messages.readMessageContents`: these require user accounts. Switching a bot from HTTP Bot API

@@ -10,6 +10,7 @@ import { installPollingInbox, currentDelivery } from './deliveryQueue.js';
 import { dialogParticipantIds, resolveChatName } from '../max/names.js';
 import { maxFetch } from '../max/ca.js';
 import { createLogger } from '../logger.js';
+import { initializeStandaloneHistory } from './standaloneHistory.js';
 
 const logger = createLogger('separate-groups');
 interface Request { code: string; maxChatId: string; title: string; topicId: number; created: number }
@@ -194,8 +195,9 @@ export class SeparateGroups {
   private async open(record: SeparateGroup): Promise<void> {
     const stateDirectory = path.join(process.cwd(), '.data', 'separate-groups', createHash('sha256').update(record.maxChatId).digest('hex').slice(0, 24));
     const map = new ChatMapStore(path.join(stateDirectory, 'chat-map.json'));
-    if (!await map.getByMaxChatId(record.maxChatId)) await map.upsert({ maxChatId: record.maxChatId, telegramTopicId: 1, title: record.title, createdAt: new Date().toISOString(), historyBackfillCursor: record.cursor });
+    if (!await map.getByMaxChatId(record.maxChatId)) await map.upsert({ maxChatId: record.maxChatId, telegramTopicId: 1, title: record.title, createdAt: new Date().toISOString() });
     const database = new BridgeDatabase(path.join(stateDirectory, 'bridge.sqlite'), () => this.db.nextCid());
+    await initializeStandaloneHistory(database, map, record.maxChatId);
     const bot = this.createBot(); bot.botInfo = this.options.bot.botInfo ?? await this.options.bot.telegram.getMe();
     const runtime = { available: await this.verify(record.telegramChatId).catch(() => false) } as Runtime;
     installStandaloneTelegram(bot, record.telegramChatId, () => runtime.available);

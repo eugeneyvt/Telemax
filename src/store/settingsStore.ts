@@ -5,6 +5,8 @@ import path from 'node:path';
 export interface BridgeSettings {
   /** How many days back a topic filled from scratch reaches; 0 = the whole history. Unset = asked (or the default). */
   historyDays?: number;
+  /** Owner opted in: a successfully sent reply marks already delivered MAX messages read. */
+  readOnReply?: boolean;
 }
 
 /**

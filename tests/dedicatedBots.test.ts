@@ -7,13 +7,15 @@ import { Telegraf, Telegram } from 'telegraf';
 import { DedicatedBots } from '../src/bridge/dedicatedBots.js';
 import { BridgeDatabase } from '../src/store/bridgeDatabase.js';
 import { ChatMapStore } from '../src/store/chatMapStore.js';
-import type { BridgeOptions } from '../src/bridge/sync.js';
+import { MessageLinkStore, type BridgeOptions } from '../src/bridge/sync.js';
 import type { MaxClient } from '../src/max/client.js';
 import { standaloneUpdate } from '../src/bridge/standalone.js';
 import { DedicatedPolling } from '../src/telegram/dedicatedPolling.js';
 import { sealDedicatedToken, openDedicatedToken } from '../src/store/dedicatedToken.js';
 import { removeReceiptCards } from '../src/bridge/receiptCleanup.js';
 import { DIR, OPCODES } from '../src/max/opcodes.js';
+import { SettingsStore } from '../src/store/settingsStore.js';
+import { initializeStandaloneHistory } from '../src/bridge/standaloneHistory.js';
 
 vi.mock('../src/max/ca.js', async original => ({ ...await original<object>(), maxFetch: vi.fn(async () => new Response(new Uint8Array([1, 2, 3]))) }));
 let directory: string, db: BridgeDatabase, manager: DedicatedBots | undefined;
@@ -48,14 +50,15 @@ async function setup() {
   const max = Object.assign(new EventEmitter(), { isLoggedIn: false, getChatHistory: vi.fn(async () => []), getMessages: vi.fn(async () => []), getReactions: vi.fn(async () => []),
     chatsInfo: vi.fn(async () => [{ id: 55, type: 'DIALOG', participants: { 1: 1, 2: 1 } }]),
     getContactInfo: vi.fn(async () => [{ id: 2, names: [{ type: 'CUSTOM', name: 'Метка контакта' }], baseUrl: 'https://example.invalid/avatar.jpg' }]),
-    sendMessage: vi.fn(async (_chat, _text, _att, _reply, options) => ({ cid: options?.cid ?? ++counter, messageId: BigInt(++counter), time: Date.now(), attaches: [] })),
+    sendMessage: vi.fn(async (_chat, _text, _att, _reply, options) => ({ cid: options?.cid ?? ++counter, messageId: BigInt(++counter), time: Date.now(), attaches: [] })), markRead: vi.fn(async () => {}),
   }) as unknown as MaxClient;
   const profiles = new Map();
+  const settings = new SettingsStore(path.join(directory, 'settings.json')); await settings.set({ readOnReply: true });
   const map = new ChatMapStore(path.join(directory, 'map.json'));
   await map.upsert({ maxChatId: '55', telegramTopicId: 7, title: 'Метка контакта', createdAt: 'fixture', historyBackfillCursor: '1700000000000' });
   let bot = new Telegraf('123:ROOT_FAKE_TOKEN'); bot.botInfo = info;
   const forbidden = async (): Promise<never> => { throw new Error('Fixture operation forbidden'); };
-  const options = (): BridgeOptions => ({ bot, max, database: db, ownerUserId: 42, targetGroupId: '-10055', chatMapStore: map,
+  const options = (): BridgeOptions => ({ bot, max, database: db, ownerUserId: 42, targetGroupId: '-10055', chatMapStore: map, settings,
     getChats: () => [{ id: 55, type: 'DIALOG', participants: { 1: 1, 2: 1 } }], getMyAccountId: () => 1, getContactProfiles: () => profiles, getActivePhone: () => '',
     getMaxState: () => ({ connected: true, lastLoginAt: 1 }), triggerFullResync: forbidden, killEverything: forbidden, suspendChatSync: forbidden,
     auth: { getLastKnownPhone: () => '', requestSms: forbidden, verifyCode: forbidden, checkPassword: forbidden }, pause: { start: () => {}, stop: () => true, until: () => null } });
@@ -72,7 +75,7 @@ async function setup() {
     manager!.acceptManagement({ update_id: 3, callback_query: { from: { id: 42 }, data: `tlmx_bot_bind:${r.code}:456` } } as any); await manager!.tick();
   }
   const runtime = () => (manager as any).runtimes.get('55') as any;
-  return { get bot() { return bot; }, max, map, calls, request, candidate, bind, runtime, previousChat,
+  return { get bot() { return bot; }, max, map, settings, calls, request, candidate, bind, runtime, previousChat,
     inbox: (u: any[]) => { inbox = u; }, enable: (v: boolean) => { managerEnabled = v; },
     restart: async () => { await manager!.stop(); manager!.closeDatabases(); bot = new Telegraf('123:ROOT_FAKE_TOKEN'); bot.botInfo = info; manager = make(); await manager.start(); } };
 }
@@ -118,15 +121,69 @@ describe('dedicated MAX bot provisioning', () => {
     expect(db.values('dedicatedManagementInbox')).toHaveLength(1);
     fault.mockRestore(); await manager!.tick(); expect(manager!.records()).toHaveLength(1); expect(db.values('dedicatedTokens')).toHaveLength(1);
   });
-  it('freezes the old destination only after the owner starts the new bot and copies its cursor', async () => {
+  it('freezes the old destination after Start and gives the new bot its own history cursor', async () => {
     const h = await setup(); await h.request(); await h.candidate(); await h.bind(); (h.max as any).isLoggedIn = true;
     await h.runtime().poll.batch([standaloneUpdate(msg(20, '/start bridge', 42, 42))]); await manager!.tick();
     expect(manager!.manages('55')).toBe(true); expect(h.previousChat).toHaveBeenCalledWith('55');
     expect((await h.map.getByMaxChatId('55'))?.dedicatedBotId).toBe(456);
-    expect((await h.runtime().map.getByMaxChatId('55'))?.historyBackfillCursor).toBe('1700000000000');
+    expect((await h.runtime().map.getByMaxChatId('55'))?.historyBackfillCursor).toBeUndefined();
     expect(h.calls.some(c => c.id === 456 && c.method === 'setMyName' && c.payload.name === 'Метка контакта · MAX')).toBe(true);
     const avatar = h.calls.find(c => c.id === 456 && c.method === 'setMyProfilePhoto');
     expect(JSON.parse(avatar!.payload.photo)).toEqual({ type: 'static', photo: 'attach://avatar' }); expect(Buffer.isBuffer(avatar!.payload.avatar.source)).toBe(true);
+  });
+  it('backfills older messages skipped by the source cursor, then resumes without duplicates', async () => {
+    vi.useRealTimers();
+    const h = await setup(); await h.request(); await h.candidate(); await h.bind();
+    const now = Date.now(); await h.map.advanceHistoryCursor('55', now - 1000);
+    vi.mocked(h.max.getChatHistory).mockResolvedValue([{ id: 90n, sender: 2, time: now - 60_000, text: 'older missing history' }]);
+    (h.max as any).isLoggedIn = true;
+    const started = h.runtime().poll.batch([standaloneUpdate(msg(50, '/start bridge', 42, 42))]);
+    await started; await manager!.tick(); await manager!.sync();
+    expect(h.calls.filter(c => c.id === 456 && c.method === 'sendMessage' && c.payload.text?.includes('older missing history'))).toHaveLength(1);
+    expect(h.max.markRead).not.toHaveBeenCalled();
+    await h.restart();
+    expect(h.calls.filter(c => c.id === 456 && c.method === 'sendMessage' && c.payload.text?.includes('older missing history'))).toHaveLength(1);
+  }, 15000);
+  it('repairs a legacy destination once and preserves local aliases and later progress', async () => {
+    const h = await setup(); await h.request(); await h.candidate(); await h.bind();
+    const r = h.runtime(); r.db.delete('standaloneHistory', 'destination-v1');
+    await r.map.advanceHistoryCursor('55', 1700000000000);
+    new MessageLinkStore(100, r.db).add({ maxChatId: '55', maxMessageId: 77n, telegramMessageId: 99 });
+    await initializeStandaloneHistory(r.db, r.map, '55');
+    expect((await r.map.getByMaxChatId('55')).historyBackfillCursor).toBeUndefined();
+    expect(r.db.findLink('tg', '', 99)).toBeDefined();
+    await r.map.advanceHistoryCursor('55', 1700000000001); await initializeStandaloneHistory(r.db, r.map, '55');
+    expect((await r.map.getByMaxChatId('55')).historyBackfillCursor).toBe('1700000000001');
+  });
+  it('marks only the frozen delivered boundary after a confirmed reply and safely retries a failed read mark', async () => {
+    const h = await setup(); await h.request(); await h.candidate(); await h.bind(); (h.max as any).isLoggedIn = true;
+    await h.runtime().poll.batch([standaloneUpdate(msg(60, '/start bridge', 42, 42))]); await manager!.tick();
+    const r = h.runtime(); r.bridge.deliveryQueue.stop();
+    new MessageLinkStore(100, r.db).add({ maxChatId: '55', maxMessageId: 80n, telegramMessageId: 800 });
+    await r.poll.batch([standaloneUpdate(msg(61, 'my reply', 42, 42))]);
+    new MessageLinkStore(100, r.db).add({ maxChatId: '55', maxMessageId: 81n, telegramMessageId: 801 });
+    vi.mocked(h.max.markRead).mockRejectedValueOnce(new Error('Read mark refused'));
+    r.bridge.deliveryQueue.start(); await r.bridge.deliveryQueue.drain(); r.bridge.deliveryQueue.stop();
+    expect(h.max.sendMessage).toHaveBeenCalledTimes(1); expect(h.max.markRead).toHaveBeenCalledWith('55', 80n);
+    const job = r.db.pending()[0]; expect(job.status).toBe('failed'); r.db.retryJob(job.id);
+    r.bridge.deliveryQueue.start(); await r.bridge.deliveryQueue.drain(); r.bridge.deliveryQueue.stop();
+    expect(h.max.sendMessage).toHaveBeenCalledTimes(1); expect(h.max.markRead).toHaveBeenLastCalledWith('55', 80n);
+    expect(r.db.pending()).toHaveLength(0);
+    const before = vi.mocked(h.max.markRead).mock.calls.length;
+    const edit = standaloneUpdate(msg(62, 'edited reply', 42, 42)) as any; edit.edited_message = { ...edit.message, message_id: 61 }; delete edit.message;
+    await r.poll.batch([edit]); r.bridge.deliveryQueue.start(); await r.bridge.deliveryQueue.drain(); r.bridge.deliveryQueue.stop();
+    expect(h.max.markRead).toHaveBeenCalledTimes(before);
+  });
+  it('does not mark messages read when sending fails or the reply policy is disabled', async () => {
+    const h = await setup(); await h.request(); await h.candidate(); await h.bind(); (h.max as any).isLoggedIn = true;
+    await h.runtime().poll.batch([standaloneUpdate(msg(70, '/start bridge', 42, 42))]); await manager!.tick();
+    const r = h.runtime(); new MessageLinkStore(100, r.db).add({ maxChatId: '55', maxMessageId: 80n, telegramMessageId: 800 });
+    vi.mocked(h.max.sendMessage).mockRejectedValueOnce(new Error('Send refused'));
+    await r.poll.batch([standaloneUpdate(msg(71, 'failed reply', 42, 42))]); await r.bridge.deliveryQueue.drain();
+    expect(h.max.markRead).not.toHaveBeenCalled();
+    r.db.cancelPending(); await h.settings.set({ readOnReply: false });
+    await r.poll.batch([standaloneUpdate(msg(72, 'reply with auto-read disabled', 42, 42))]); await r.bridge.deliveryQueue.drain();
+    expect(h.max.sendMessage).toHaveBeenCalledTimes(2); expect(h.max.markRead).not.toHaveBeenCalled();
   });
   it('persists owner messages before offset advancement while source deliveries prevent migration', async () => {
     const h = await setup(); await h.request(); await h.candidate(); await h.bind();

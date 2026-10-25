@@ -12,6 +12,7 @@ import { wireBridge, type BridgeOptions, type WiredBridge } from './sync.js';
 import { dialogParticipantIds, resolveChatName } from '../max/names.js';
 import { maxFetch } from '../max/ca.js';
 import { createLogger } from '../logger.js';
+import { initializeStandaloneHistory } from './standaloneHistory.js';
 
 const logger = createLogger('dedicated-bots');
 interface Request { code: string; maxChatId: string; title: string; topicId: number; created: number; username: string }
@@ -33,6 +34,7 @@ export class DedicatedBots {
   private readonly runtimes = new Map<string, Runtime>();
   private timer?: ReturnType<typeof setInterval>;
   private busy?: Promise<void>;
+  private syncing?: Promise<void>;
   private stopping = false;
   constructor(private readonly options: BridgeOptions, private readonly deps: Dependencies) {
     if (!options.database || !options.ownerUserId) throw new Error('Dedicated bots require persistence and an owner');
@@ -127,7 +129,7 @@ export class DedicatedBots {
         if (this.byMax(record.maxChatId)?.state === 'active' && this.options.max.isLoggedIn) await this.identity(this.byMax(record.maxChatId)!);
       } catch { logger.warn('Dedicated bot activation or identity remains pending'); }
     }
-    await this.sync().catch(() => logger.warn('Dedicated bot history remains saved for catch-up'));
+    void this.sync().catch(() => logger.warn('Dedicated bot history remains saved for catch-up'));
   }
   private async candidate(c: Candidate): Promise<void> {
     const record = this.records().find(r => r.botId === c.botId);
@@ -204,6 +206,7 @@ export class DedicatedBots {
     const db = new BridgeDatabase(path.join(directory, 'bridge.sqlite'), () => this.db.nextCid());
     const map = new ChatMapStore(path.join(directory, 'chat-map.json'));
     if (!await map.getByMaxChatId(record.maxChatId)) await map.upsert({ maxChatId: record.maxChatId, telegramTopicId: 1, title: record.title, createdAt: new Date().toISOString() });
+    await initializeStandaloneHistory(db, map, record.maxChatId);
     const runtime = { available: record.state === 'active', identityAt: 0 } as Runtime;
     installStandaloneTelegram(bot, String(this.options.ownerUserId), () => runtime.available, 'bot');
     const call = bot.telegram.callApi.bind(bot.telegram);
@@ -250,12 +253,8 @@ export class DedicatedBots {
     this.db.set('dedicatedBots', record.maxChatId, { ...record, state: 'preparing' });
     const original = await this.options.chatMapStore.getByMaxChatId(record.maxChatId); if (!original) throw new Error('Original chat mapping missing');
     await this.options.chatMapStore.upsert({ ...original, dedicatedBotId: record.botId });
-    const cursor = await this.deps.previousChat(record.maxChatId);
+    await this.deps.previousChat(record.maxChatId);
     if (this.db.pending(1_000_000).some(job => job.chat === record.maxChatId)) throw new Error('Previous delivery queue must settle first');
-    const source = await this.options.chatMapStore.getByMaxChatId(record.maxChatId);
-    const current = (await runtime.map.getByMaxChatId(record.maxChatId))!;
-    const best = Math.max(Number(current.historyBackfillCursor ?? 0), Number(cursor ?? source?.historyBackfillCursor ?? 0));
-    await runtime.map.upsert({ ...current, ...(best > 0 ? { historyBackfillCursor: String(best) } : {}) });
     this.db.set('dedicatedBots', record.maxChatId, { ...record, state: 'active' }); runtime.available = true;
     runtime.bridge.deliveryQueue?.wake();
     await this.identity(this.byMax(record.maxChatId)!);
@@ -285,12 +284,15 @@ export class DedicatedBots {
     }
     this.db.set('dedicatedBots', record.maxChatId, { ...this.byMax(record.maxChatId)!, title, avatarKey }); runtime.identityAt = Date.now();
   }
-  async sync(): Promise<void> {
-    if (!this.options.max.isLoggedIn || this.stopping) return;
-    for (const record of this.records()) {
-      const r = this.runtimes.get(record.maxChatId); if (!r?.available) continue;
-      await r.bridge.chatSync.runInChat(record.maxChatId, async () => { await r.bridge.chatSync.ensureCaughtUp(record.maxChatId); });
-    }
+  sync(): Promise<void> {
+    if (!this.options.max.isLoggedIn || this.stopping) return Promise.resolve();
+    this.syncing ??= Promise.allSettled(this.records().map(async record => {
+      const r = this.runtimes.get(record.maxChatId); if (!r?.available) return;
+      await r.bridge.chatSync.runInChat(record.maxChatId, async () => { await r.bridge.chatSync.ensureCaughtUp(record.maxChatId, () => this.stopping); });
+    })).then(results => {
+      if (results.some(r => r.status === 'rejected')) throw new Error('Dedicated history catch-up remains pending');
+    }).finally(() => { this.syncing = undefined; });
+    return this.syncing;
   }
   health() {
     const states = [...this.runtimes.values()].map(r => r.db.health()); const oldest = states.flatMap(s => s.oldestAt == null ? [] : [s.oldestAt]);
@@ -301,6 +303,7 @@ export class DedicatedBots {
   }
   async stop(): Promise<void> {
     this.stopping = true; if (this.timer) clearInterval(this.timer); await this.busy;
+    await this.syncing?.catch(() => {});
     for (const r of this.runtimes.values()) { await r.poll.stop(); await r.bridge.stop(); r.detach(); }
   }
   closeDatabases(): void { for (const r of this.runtimes.values()) r.db.close(); }

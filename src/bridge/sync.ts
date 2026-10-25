@@ -2084,13 +2084,24 @@ export function wireBridge({
   };
   void cleanReceipts();
   const readTimer = setInterval(() => void cleanReceipts(), 60_000); readTimer.unref();
-  interface QueuedUpdate { update: Update; operationMapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; mapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; link?: MessageLink; linkFrozen?: boolean; pollLink?: PollLink }
+  interface QueuedUpdate { update: Update; operationMapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; mapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; link?: MessageLink; linkFrozen?: boolean; pollLink?: PollLink; readTarget?: { chatId: string; messageId: unknown } }
   const deliveryQueue = database ? new DeliveryQueue(database, async (payload) => {
     if (isTelegramAlbum(payload)) {
       await telegramAlbums!.run(payload, bot, max, messageLinks, chat => chatMapStore.getByMaxChatId(chat), rememberOutgoingSend);
+      if (payload.readTarget) await max.markRead(payload.readTarget.chatId, payload.readTarget.messageId);
     } else if (isIncomingEdit(payload)) {
       await chatSync.runInChat(payload.maxChatId, () => incomingEdits!.run(payload));
-    } else await bot.handleUpdate((payload as QueuedUpdate).update);
+    } else {
+      const queued = payload as QueuedUpdate;
+      await bot.handleUpdate(queued.update);
+      const message = (queued.update as { message?: { message_id: number } }).message;
+      const sent = message ? messageLinks.getByTelegram(message.message_id) : undefined;
+      // Only a confirmed outgoing reply counts. Commands, edits, reactions and failed sends do
+      // not mark anything read; the saved boundary never grows while this job waits or retries.
+      if (queued.readTarget && sent?.outgoing && String(sent.maxChatId) === queued.readTarget.chatId) {
+        await max.markRead(queued.readTarget.chatId, queued.readTarget.messageId);
+      }
+    }
   }, () => {
     const id = getMyAccountId();
     if (!max.isLoggedIn || id == null || wiping) return false;
@@ -2155,13 +2166,16 @@ export function wireBridge({
     }
     if (!mapping || mapping.banned) return;
     if ((mapping.separateTelegramChatId || mapping.dedicatedBotId) && message && !u.edited_message && !message.text?.startsWith('/')) return;
+    const witness = settings?.get().readOnReply && u.message && !message.text?.startsWith('/') && !mapping.pendingUserId
+      ? messageLinks.newestIncoming(mapping.maxChatId) : undefined;
+    const readTarget = witness ? { chatId: String(witness.maxChatId), messageId: witness.maxMessageId } : undefined;
     if (message?.media_group_id && !u.edited_message && telegramAlbums) {
-      telegramAlbums.add(update, mapping);
+      telegramAlbums.add(update, mapping, readTarget);
       return;
     }
     const sourceId = u.edited_message?.message_id ?? message?.reply_to_message?.message_id ?? reaction?.message_id ?? pollClick?.message?.message_id;
     const link = sourceId != null ? messageLinks.getByTelegram(sourceId) : undefined;
-    database.enqueue(`${targetGroupId}:${update.update_id}`, String(mapping.maxChatId), { update, mapping, link, ...(poll ? { pollLink: pollLinks.getByTelegramPollId(poll.poll_id) } : {}) } satisfies QueuedUpdate);
+    database.enqueue(`${targetGroupId}:${update.update_id}`, String(mapping.maxChatId), { update, mapping, link, readTarget, ...(poll ? { pollLink: pollLinks.getByTelegramPollId(poll.poll_id) } : {}) } satisfies QueuedUpdate);
   }
   if (deliveryQueue && database) {
     installPollingInbox(bot, update => acceptUpdate(update, true), () => { batchMayContainAuth = false; });

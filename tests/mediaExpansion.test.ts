@@ -22,6 +22,12 @@ const mapping = { maxChatId: '55', telegramTopicId: 7, createdAt: 'fixture' };
 const update = (id: number, text = '') => ({ update_id: id, message: { message_id: id + 100, media_group_id: 'album1', caption: text, photo: [{ file_id: `photo${id}`, file_size: 5 }] } }) as any;
 
 describe('durable Telegram album assembly', () => {
+  it('keeps the first part read boundary across later parts and assembler restarts', () => {
+    const first = new TelegramAlbums(db, '-10055').add(update(1), mapping, { chatId: '55', messageId: 80n });
+    const second = new TelegramAlbums(db, '-10055').add(update(2), mapping, { chatId: '55', messageId: 81n });
+    expect(second.id).toBe(first.id);
+    expect((second.payload as TelegramAlbum).readTarget).toEqual({ chatId: '55', messageId: 80n });
+  });
   it('debounces and deduplicates individual updates while blocking following chat jobs', () => {
     const albums = new TelegramAlbums(db, '-10055');
     const first = albums.add(update(1), mapping); const second = albums.add(update(2), mapping);

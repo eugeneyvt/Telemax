@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import type { Telegraf } from 'telegraf';
 import type { Update } from 'telegraf/types';
@@ -11,6 +11,7 @@ import { standaloneMax, standaloneUpdate, standaloneTitle, installStandaloneTele
 import { wireBridge, type BridgeOptions, type WiredBridge } from './sync.js';
 import { dialogParticipantIds, resolveChatName } from '../max/names.js';
 import { maxFetch } from '../max/ca.js';
+import { composeMaxAvatar, maxAvatarKey } from './maxAvatar.js';
 import { createLogger } from '../logger.js';
 import { initializeStandaloneHistory } from './standaloneHistory.js';
 
@@ -289,11 +290,16 @@ export class DedicatedBots {
     }
     const photo = (profile ?? raw) as { baseRawUrl?: string; baseUrl?: string; photoId?: unknown };
     // MAX's square baseUrl is JPEG; baseRawUrl can be the original WebP/portrait image.
-    const url = photo.baseUrl ?? photo.baseRawUrl, avatarKey = url ? createHash('sha256').update(String(photo.photoId ?? url)).digest('hex') : undefined;
-    if (url && avatarKey !== record.avatarKey && new URL(url).protocol === 'https:') {
-      const response = await maxFetch(url, { signal: AbortSignal.timeout(15_000) });
-      if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 10 * 1024 * 1024) throw new Error('Avatar unavailable');
-      const data = Buffer.from(await response.arrayBuffer()); if (data.length > 10 * 1024 * 1024) throw new Error('Avatar too large');
+    const url = photo.baseUrl ?? photo.baseRawUrl, avatarKey = maxAvatarKey({ url, photoId: photo.photoId }, title);
+    if (avatarKey !== record.avatarKey) {
+      let source: Buffer | undefined;
+      if (url) {
+        if (new URL(url).protocol !== 'https:') throw new Error('Avatar requires HTTPS');
+        const response = await maxFetch(url, { signal: AbortSignal.timeout(15_000) });
+        if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 10 * 1024 * 1024) throw new Error('Avatar unavailable');
+        source = Buffer.from(await response.arrayBuffer()); if (source.length > 10 * 1024 * 1024) throw new Error('Avatar too large');
+      }
+      const data = await composeMaxAvatar(source, title);
       // Telegraf 4 predates InputProfilePhoto: encode the nested JSON and attach the binary explicitly.
       await api(runtime.bot, 'setMyProfilePhoto', { photo: JSON.stringify({ type: 'static', photo: 'attach://avatar' }), avatar: { source: data, filename: 'max-avatar.jpg' } });
     }

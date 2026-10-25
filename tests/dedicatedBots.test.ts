@@ -18,7 +18,7 @@ import { SettingsStore } from '../src/store/settingsStore.js';
 import { initializeStandaloneHistory } from '../src/bridge/standaloneHistory.js';
 import { maxFetch } from '../src/max/ca.js';
 
-vi.mock('../src/max/ca.js', async original => ({ ...await original<object>(), maxFetch: vi.fn(async () => new Response(new Uint8Array([1, 2, 3]))) }));
+vi.mock('../src/max/ca.js', async original => ({ ...await original<object>(), maxFetch: vi.fn(async () => new Response(Buffer.from('/9j/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAEAAQDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAL/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCwFAV//9k=', 'base64'))) }));
 let directory: string, db: BridgeDatabase, manager: DedicatedBots | undefined;
 beforeEach(async () => {
   directory = await mkdtemp(path.join(os.tmpdir(), 'telemax-dedicated-')); vi.spyOn(process, 'cwd').mockReturnValue(directory);

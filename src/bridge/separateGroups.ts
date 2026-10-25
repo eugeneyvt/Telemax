@@ -9,6 +9,7 @@ import { standaloneMax, standaloneUpdate, standaloneTitle, installStandaloneTele
 import { installPollingInbox, currentDelivery } from './deliveryQueue.js';
 import { dialogParticipantIds, resolveChatName } from '../max/names.js';
 import { maxFetch } from '../max/ca.js';
+import { composeMaxAvatar, maxAvatarKey } from './maxAvatar.js';
 import { createLogger } from '../logger.js';
 import { initializeStandaloneHistory } from './standaloneHistory.js';
 
@@ -233,11 +234,16 @@ export class SeparateGroups {
     }
     const photo = (profile ?? raw) as { baseRawUrl?: string; baseUrl?: string; photoId?: unknown };
     const url = photo.baseUrl ?? photo.baseRawUrl;
-    const avatarKey = url && createHash('sha256').update(String(photo.photoId ?? url)).digest('hex');
-    if (url && avatarKey !== this.byMax(record.maxChatId)?.avatarKey && new URL(url).protocol === 'https:') {
-      const response = await maxFetch(url, { signal: AbortSignal.timeout(15000) });
-      if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 10 * 1024 * 1024) throw new Error('Avatar download unavailable');
-      const data = Buffer.from(await response.arrayBuffer()); if (data.length > 10 * 1024 * 1024) throw new Error('Avatar too large');
+    const avatarKey = maxAvatarKey({ url, photoId: photo.photoId }, title);
+    if (avatarKey !== this.byMax(record.maxChatId)?.avatarKey) {
+      let source: Buffer | undefined;
+      if (url) {
+        if (new URL(url).protocol !== 'https:') throw new Error('Avatar requires HTTPS');
+        const response = await maxFetch(url, { signal: AbortSignal.timeout(15_000) });
+        if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 10 * 1024 * 1024) throw new Error('Avatar unavailable');
+        source = Buffer.from(await response.arrayBuffer()); if (source.length > 10 * 1024 * 1024) throw new Error('Avatar too large');
+      }
+      const data = await composeMaxAvatar(source, title);
       await this.options.bot.telegram.setChatPhoto(record.telegramChatId, { source: data, filename: 'max-avatar.jpg' });
       this.db.set('separateGroups', record.maxChatId, { ...this.byMax(record.maxChatId)!, avatarKey });
     }

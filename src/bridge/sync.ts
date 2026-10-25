@@ -1312,7 +1312,7 @@ export class ChatCatchUp {
    */
   async ensureCaughtUp(chatId: unknown, isCancelled?: () => boolean): Promise<number | undefined> {
     const mapping = await this.deps.chatMapStore.getByMaxChatId(chatId);
-    if (!mapping || mapping.banned || mapping.pendingUserId != null) return undefined;
+    if (!mapping || mapping.banned || mapping.pendingUserId != null || mapping.separateTelegramChatId || mapping.dedicatedBotId) return undefined;
     if (this.caughtUp.has(String(chatId))) return mapping.telegramTopicId;
     const cancelled = (): boolean => this.deps.isWiping() || (isCancelled?.() ?? false);
     try {
@@ -4987,7 +4987,8 @@ export async function syncAllChatsToTelegram(
         // Checked again once the queue is ours: a live job of this chat may have held it for a while.
         if (isCancelled?.()) throw new SyncCancelledError();
         // Banned chats (/ban) stay muted through a full resync too — don't recreate their topic.
-        if ((await chatMapStore.getByMaxChatId(chatId))?.banned) return;
+        const current = await chatMapStore.getByMaxChatId(chatId);
+        if (current?.banned || current?.separateTelegramChatId || current?.dedicatedBotId) return;
         const { topicId, created } = await ensureTopicForMaxChat(bot, groupId, chatId, chatMapStore, resolveDisplayName(chat));
         // Same intro card the live path sends on first contact.
         if (created) await chatSync.deps.sendCard(chatId, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
@@ -5024,7 +5025,7 @@ export async function syncAllChatsToTelegram(
     return;
   }
   // Banned and pending ("pending:<userId>", no MAX dialog yet) chats get no catch-up — not asked about either.
-  const missing = mappings.filter((m) => !inSnapshot.has(m.maxChatId) && !m.banned && m.pendingUserId == null);
+  const missing = mappings.filter((m) => !inSnapshot.has(m.maxChatId) && !m.banned && m.pendingUserId == null && !m.separateTelegramChatId && !m.dedicatedBotId);
   const described = missing.length > 0 && !isCancelled?.() ? await describeChats(chatSync.deps.max, missing.map((m) => m.maxChatId)) : new Map<string, unknown>();
   for (const mapping of missing) {
     if (isCancelled?.()) {

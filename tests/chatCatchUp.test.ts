@@ -321,6 +321,15 @@ describe('ChatCatchUp.restoreTopic', () => {
 });
 
 describe('syncAllChatsToTelegram', () => {
+  it('does not catch moved chats up in their old topics, including the missing-snapshot fallback', async () => {
+    await store.upsert({ maxChatId: '8', telegramTopicId: 80, createdAt: 'x', dedicatedBotId: 456 });
+    await store.upsert({ maxChatId: '9', telegramTopicId: 90, createdAt: 'x', separateTelegramChatId: '-200' });
+    const w = fakeWorld([msg(1, 100, 'belongs only to new destination')]);
+    await syncAllChatsToTelegram(w.sync, [{ id: 8, status: 'ACTIVE' }], () => 'Moved');
+    expect(await w.sync.ensureCaughtUp('8')).toBeUndefined();
+    expect(w.getChatHistory).not.toHaveBeenCalled(); expect(w.sends).toHaveLength(0);
+    expect(w.telegram.editForumTopic).not.toHaveBeenCalled();
+  });
   it('makes every topic available before a long first conversation starts importing', async () => {
     const w = fakeWorld(); let topic = 100;
     w.telegram.createForumTopic.mockImplementation(async (_group, name) => ({ message_thread_id: ++topic, name }));

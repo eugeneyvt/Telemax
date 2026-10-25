@@ -475,6 +475,15 @@ describe('late messages and authors', () => {
 describe('history depth (days)', () => {
   const DAY = 86_400_000;
 
+  it('selects history depth separately for each MAX chat', async () => {
+    for (const id of ['7', '8']) await store.upsert({ maxChatId: id, telegramTopicId: Number(id), title: 'Чат', createdAt: 'x' });
+    const now = Date.now(), w = fakeWorld([msg(1, now - 10 * DAY, 'между одной и двумя неделями')]);
+    const depth = vi.fn((chat: string) => chat === '7' ? 14 : 7); w.sync.deps.historyDays = depth;
+    await w.sync.ensureCaughtUp(7); await w.sync.ensureCaughtUp(8);
+    expect(depth.mock.calls).toEqual([['7'], ['8']]);
+    expect(w.sends.filter(s => s.text.includes('между одной'))).toEqual([{ text: 'между одной и двумя неделями', topicId: 7 }]);
+  });
+
   it('a topic filled from scratch gets only the last N days, under a line saying so', async () => {
     await store.upsert({ maxChatId: '7', telegramTopicId: 100, title: 'Дом', createdAt: 'x' });
     const now = Date.now();

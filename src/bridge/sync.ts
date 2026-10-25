@@ -1207,7 +1207,7 @@ export interface ChatCatchUpDeps {
   isPendingOutgoing?: (message: MaxHistoryMessage) => boolean;
   checkpointIncoming?: (chatId: unknown, messageId: unknown, topicId: number, run: () => Promise<void>) => Promise<void>;
   /** The history depth: days back a topic filled from scratch reaches (0 = the whole history). Read per fill — a change in the panel applies to the next one. */
-  historyDays?: () => number;
+  historyDays?: (chatId: string) => number;
   /** Puts a chat MAX described (CHAT_INFO) into the chat cache — so a channel missing from the chat list still gets the channel cap. */
   rememberChat?: (chat: unknown) => void;
 }
@@ -1359,7 +1359,7 @@ export class ChatCatchUp {
     if (cursor == null && isChannel) limit = limit > 0 ? Math.min(limit, CHANNEL_HISTORY_LIMIT) : CHANNEL_HISTORY_LIMIT;
     // The history depth bounds a fill from scratch by time, as the lower bound of the paging — so a
     // years-long chat is not paged through at all (a user's «Госуслуги» filled all night, GitHub #4).
-    const days = cursor == null ? (this.deps.historyDays?.() ?? 0) : 0;
+    const days = cursor == null ? (this.deps.historyDays?.(String(chatId)) ?? 0) : 0;
     const floor = days > 0 ? Date.now() - days * DAY_MS : null;
     const { messages: history, truncated, older } = await fetchFullHistory(this.deps.max, chatId, cursor ?? floor, cancelled, limit);
     const cutByDays = floor != null && older && !truncated;
@@ -2067,7 +2067,7 @@ export function wireBridge({
     isPendingOutgoing: msg => String(msg.sender) === String(getMyAccountId()) && Boolean(database?.hasPendingCid(msg.cid)),
     pollWidgets,
     rememberSticker,
-    historyDays,
+    historyDays: chatId => settings?.get().historyDaysByChat?.[chatId] ?? historyDays(),
     rememberChat,
   });
 

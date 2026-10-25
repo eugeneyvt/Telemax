@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { wireNativeTools, isDurableCommand } from './nativeTools.js';
-import { ReadReceipts } from './readReceipts.js';
+import { removeReceiptCards } from './receiptCleanup.js';
 import { participantReadMarks, messageReceiptText } from './receiptDetails.js';
 import { ReactionStore } from './reactionStore.js';
 import { TelegramAlbums, isTelegramAlbum } from './telegramAlbums.js';
@@ -2074,25 +2074,16 @@ export function wireBridge({
     edit => broadcasts.copyEdit(edit.maxChatId, edit.maxMessageId, edit.rich.text),
     (edit, link) => replaceIncomingMedia(bot, max, targetGroupId, edit.topicId, link, edit.attaches!, att => sendAttachments(bot, targetGroupId, edit.topicId, [att], { max, chatId: edit.maxChatId, messageId: edit.maxMessageId, throwOnTransient: true }))) : undefined;
   const telegramAlbums = database ? new TelegramAlbums(database, targetGroupId) : undefined;
-  const readReceipts = database ? new ReadReceipts({ db: database, bot, destination: targetGroupId, ownId: getMyAccountId,
-    topic: async chatId => {
-      const mapping = await chatMapStore.getByMaxChatId(chatId);
-      return mapping?.separateTelegramChatId ? undefined : mapping;
-    },
-    name: async userId => resolveContactTopicName(Number(userId), await resolveProfile(max, Number(userId), 'read receipt', getContactProfiles())),
-    latestOutgoing: async chatId => {
-      const link = database.links<MessageLink>(chatId, true, 1)[0];
-      if (!link) return undefined;
-      const messages = await max.getMessages(chatId, linkMaxIds(link));
-      const time = Math.max(...messages.map(m => Number(m.time)).filter(Number.isSafeInteger));
-      return Number.isSafeInteger(time) && time > 0 ? { time, telegramId: link.telegramMessageId } : undefined;
-    },
-  }) : undefined;
-  const readTimer = setInterval(() => { if (max.isLoggedIn && !wiping) {
-    for (const chat of getChats()) if (database?.links<MessageLink>(String((chat as { id?: unknown }).id), true, 1).length) readReceipts?.seed(chat);
-    void readReceipts?.flush().catch(err => logger.error('Read receipt update failed; saved for retry', err));
-  } }, 5000);
-  readTimer.unref();
+  let cleaningReceipts = false;
+  const cleanReceipts = async () => {
+    if (!database || cleaningReceipts || wiping || !database.values('readCards').length) return;
+    cleaningReceipts = true;
+    try { await removeReceiptCards(database, bot, targetGroupId); }
+    catch { logger.warn('Automatic receipt-card cleanup remains pending'); }
+    finally { cleaningReceipts = false; }
+  };
+  void cleanReceipts();
+  const readTimer = setInterval(() => void cleanReceipts(), 60_000); readTimer.unref();
   interface QueuedUpdate { update: Update; operationMapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; mapping?: Awaited<ReturnType<ChatMapStore['getByTopicId']>>; link?: MessageLink; linkFrozen?: boolean; pollLink?: PollLink }
   const deliveryQueue = database ? new DeliveryQueue(database, async (payload) => {
     if (isTelegramAlbum(payload)) {
@@ -2163,7 +2154,7 @@ export function wireBridge({
       if (link) mapping = await chatMapStore.getByMaxChatId(link.maxChatId);
     }
     if (!mapping || mapping.banned) return;
-    if (mapping.separateTelegramChatId && message && !u.edited_message && !message.text?.startsWith('/')) return;
+    if ((mapping.separateTelegramChatId || mapping.dedicatedBotId) && message && !u.edited_message && !message.text?.startsWith('/')) return;
     if (message?.media_group_id && !u.edited_message && telegramAlbums) {
       telegramAlbums.add(update, mapping);
       return;
@@ -2180,8 +2171,8 @@ export function wireBridge({
       const original = ctx.message as { message_thread_id?: number; text?: string } | undefined;
       if (original?.message_thread_id && !original.text?.startsWith('/')) {
         const mapping = await chatMapStore.getByTopicId(original.message_thread_id);
-        if (mapping?.separateTelegramChatId) {
-          await ctx.reply('Новая переписка этого чата перенесена в отдельную группу MAX. Здесь сохранена прежняя история. Список: /groups'); return;
+        if (mapping?.separateTelegramChatId || mapping?.dedicatedBotId) {
+          await ctx.reply('Новая переписка перенесена в отдельного бота или группу MAX. Здесь сохранена прежняя история. Списки: /bots и /groups'); return;
         }
       }
       await acceptUpdate(ctx.update);
@@ -2269,8 +2260,8 @@ export function wireBridge({
     const queued = currentDelivery()?.payload as QueuedUpdate | undefined;
     const mapping = queued?.mapping ? await chatMapStore.getByMaxChatId(queued.mapping.maxChatId) : await chatMapStore.getByTopicId(topic);
     if (!mapping || mapping.banned) throw new Error('Чат недоступен; операция сохранена в очереди.');
-    if (mapping.separateTelegramChatId && /^\/(silent|schedule)(?:@\w+)?(?:\s|$)/.test((ctx.message as { text?: string }).text ?? '')) {
-      await ctx.reply('Отправляйте новые сообщения в отдельной группе этого MAX-чата. Список: /groups'); return null;
+    if ((mapping.separateTelegramChatId || mapping.dedicatedBotId) && /^\/(silent|schedule)(?:@\w+)?(?:\s|$)/.test((ctx.message as { text?: string }).text ?? '')) {
+      await ctx.reply('Отправляйте новые сообщения в выделенном чате MAX. Списки: /bots и /groups'); return null;
     }
     const reply = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
     const link = reply && reply.message_id !== topic ? operationLink(reply.message_id) : undefined;
@@ -2297,7 +2288,6 @@ export function wireBridge({
     const latest = messages.sort((a, b) => Number(b.time) - Number(a.time))[0];
     if (!latest) { await ctx.reply('MAX не вернул исходное сообщение; статус неизвестен.'); return; }
     const chat = (await max.chatsInfo([target.link.maxChatId]))[0];
-    readReceipts?.seed(chat);
     await ctx.reply(await messageReceiptText(latest, participantReadMarks(chat, getMyAccountId()), getMyAccountId(), async id => resolveContactTopicName(Number(id), await resolveProfile(max, Number(id), 'receipt details', getContactProfiles()))), { message_thread_id: target.mapping.telegramTopicId,
       reply_parameters: { message_id: target.link.telegramMessageId, allow_sending_without_reply: true } });
   });
@@ -2374,7 +2364,6 @@ export function wireBridge({
   function rememberOutgoingSend(chatId: unknown, cid: number, serverTime: unknown): void {
     outgoingCids.remember(cid);
     lastOutAt = Date.now();
-    readReceipts?.touch(chatId);
     chatSync.runInChat(chatId, () => chatSync.advanceCursor(chatId, serverTime, 'outgoing send')).catch(() => undefined);
   }
 
@@ -2545,7 +2534,7 @@ export function wireBridge({
     const due: MessageLink[] = [];
     const liveKeys = new Set<string>();
     for (const link of messageLinks.outgoingLinks()) {
-      if ((await chatMapStore.getByMaxChatId(link.maxChatId))?.separateTelegramChatId) continue;
+      if (await chatMapStore.getByMaxChatId(link.maxChatId).then(m => m?.separateTelegramChatId || m?.dedicatedBotId)) continue;
       const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
       liveKeys.add(key);
       const interval = probeIntervalMs(now - (link.createdAt ?? now));
@@ -2663,7 +2652,6 @@ export function wireBridge({
       const payload = event.payload as MaxPushPayload;
       if (payload?.chatId != null) chatSync.runInChat(payload.chatId, () => handleMaxPush(payload)).catch((err) => logger.error('handleMaxPush crashed', err));
     } else if (event.opcode === OPCODES.PUSH_READ_MARK) {
-      readReceipts?.accept(event.payload);
     } else if (event.opcode === OPCODES.PUSH_TYPING) {
       void handleMaxTyping(event.payload as MaxTypingPayload);
     } else if (event.opcode === OPCODES.CHAT_UPDATE) {
@@ -2964,7 +2952,7 @@ export function wireBridge({
     if (!forceOwn && message.cid != null && (outgoingCids.has(message.cid) || (String(message.sender) === String(getMyAccountId()) && database?.hasPendingCid(message.cid))) && message.status !== 'REMOVED') return;
     // Banned chat (/ban): drop everything for it — no mirror, no topic recreate.
     const banCheck = await chatMapStore.getByMaxChatId(chatId);
-    if (banCheck?.banned || banCheck?.separateTelegramChatId) return;
+    if (banCheck?.banned || banCheck?.separateTelegramChatId || banCheck?.dedicatedBotId) return;
 
     let text = message.text;
     let attaches = Array.isArray(message.attaches) ? message.attaches : [];
@@ -3364,7 +3352,7 @@ export function wireBridge({
 
 /read — отметить сообщение прочитанным в MAX: ответом на него или до последнего входящего в теме
 /receipt — подтверждённое MAX прочтение исходящего сообщения (ответом на него); прослушивание отдельно не подтверждается
-/separate — перенести новую переписку этой темы в отдельную закрытую Telegram-группу с именем и аватаркой MAX
+/bot — выделить контакт в отдельного бота с именем и фотографией MAX\n/bots — список выделенных ботов и выбор контакта\n/separate — перенести новую переписку этой темы в отдельную закрытую Telegram-группу с именем и аватаркой MAX
 /groups — список отдельных групп (в основной группе управления)
 /pin — закрепить в MAX сообщение, на которое отвечаете
 /unpin — снять закрепление в MAX

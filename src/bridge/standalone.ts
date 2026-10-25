@@ -13,10 +13,10 @@ export function standaloneUpdate(update: Update): Update {
   return u;
 }
 
-export function installStandaloneTelegram(bot: Telegraf, destination: string, available: () => boolean): void {
+export function installStandaloneTelegram(bot: Telegraf, destination: string, available: () => boolean, mode: 'group' | 'bot' = 'group'): void {
   const original = bot.telegram.callApi.bind(bot.telegram);
   bot.telegram.callApi = (async (method: string, raw: any, extra?: unknown) => {
-    if (method === 'getUpdates') throw new Error('Separate groups never poll Telegram independently.');
+    if (method === 'getUpdates' && mode === 'group') throw new Error('Separate groups never poll Telegram independently.');
     const payload = { ...raw };
     if (payload.chat_id != null) {
       if (String(payload.chat_id) !== destination) throw new Error('Separate-group destination mismatch.');
@@ -30,6 +30,11 @@ export function installStandaloneTelegram(bot: Telegraf, destination: string, av
     if (method === 'createForumTopic') throw new Error('A separate group cannot acquire another MAX chat.');
     if (method === 'deleteForumTopic') return true; // Never delete the real group through a topic operation.
     if (method === 'editForumTopic') {
+      if (mode === 'bot') {
+        const info = await (original as Function)('getChat', { chat_id: destination }, extra);
+        if (info.type !== 'private' || String(info.id) !== destination) throw new Error('Dedicated bot destination mismatch');
+        return true;
+      }
       try {
         return await (original as Function)('setChatTitle', { chat_id: destination, title: standaloneTitle(payload.name ?? 'MAX') }, extra);
       } catch (error) {

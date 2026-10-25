@@ -13,6 +13,7 @@ import { SettingsStore } from '../store/settingsStore.js';
 import { DEFAULT_HISTORY_DAYS } from '../bridge/history.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp, type BridgeOptions } from '../bridge/sync.js';
 import { SeparateGroups } from '../bridge/separateGroups.js';
+import { DedicatedBots } from '../bridge/dedicatedBots.js';
 import { systemView } from '../bridge/panel.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
 import { isStaleCallbackQuery, isTransientTelegramError } from '../bridge/transient.js';
@@ -60,13 +61,14 @@ const sessionStore = new SessionStore();
 const destinationDir = path.join(process.cwd(), '.data', `telegram-${config.targetTelegramGroup || 'unconfigured'}`);
 const chatMapStore = new ChatMapStore(path.join(destinationDir, 'chat-map.json'));
 const database = config.telegramEnabled ? new BridgeDatabase(path.join(destinationDir, 'bridge.sqlite')) : undefined;
-process.once('exit', () => { separateGroups?.closeDatabases(); database?.close(); });
+process.once('exit', () => { dedicatedBots?.closeDatabases(); separateGroups?.closeDatabases(); database?.close(); });
 const settingsStore = new SettingsStore();
 const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 
 let bot: Telegraf | null = null;
 let deliveryQueue: DeliveryQueue | undefined;
 let separateGroups: SeparateGroups | undefined;
+let dedicatedBots: DedicatedBots | undefined;
 let chatSync: ChatCatchUp | null = null;
 // «📜 Сколько истории перенести?» (sync.ts) — asked before a sync that fills every chat from scratch.
 let askHistoryDepth: (() => Promise<number>) | null = null;
@@ -205,11 +207,12 @@ function syncChatsIfPossible(): Promise<void> {
     if (askHistoryDepth && historyQuestionDue?.() && (await chatMapStore.list()).length === 0) await askHistoryDepth();
     await syncAllChatsToTelegram(
       sync,
-      cachedChats.filter((chat: any) => !separateGroups?.byMax(chat?.id)),
+      cachedChats.filter((chat: any) => !separateGroups?.byMax(chat?.id) && !dedicatedBots?.manages(chat?.id)),
       (chat) => resolveChatName(chat, myAccountId, contactProfiles),
       () => generation !== chatSyncGeneration,
     );
     await separateGroups?.sync();
+    await dedicatedBots?.sync();
   })()
     .catch((err) => {
       catchUpRetryRequestedDuringRun = true; // not a clean run — keep the backoff where it is
@@ -439,15 +442,27 @@ async function startServer(): Promise<void> {
         },
         restartBridge: (where) => void restartFromPanel(where),
       };
+      dedicatedBots = new DedicatedBots(bridgeOptions, {
+        createBot: token => createBotSafely(token)!,
+        groupChat: id => separateGroups?.byTelegram(id)?.maxChatId,
+        previousChat: async id => {
+          await deliveryQueue?.drain();
+          if (database?.pending(1_000_000).some(job => job.chat === id)) throw new Error('Source delivery remains pending');
+          await chatSync?.runInChat(id, async () => {});
+          return separateGroups?.retireForBot(id);
+        },
+      });
       separateGroups = new SeparateGroups(bridgeOptions, () => createBotSafely(config.telegramBotToken)!);
       await separateGroups.start();
+      await dedicatedBots.start();
       installGroupDiscovery(bot, config.telegramOwnerId, config.targetTelegramGroup, async candidate => {
         await writeFile(path.join(process.cwd(), '.data', 'group-candidate.json'), JSON.stringify(candidate), { mode: 0o600 });
       });
       ({ chatSync, askHistoryDepth, historyQuestionDue, deliveryQueue } = wireBridge({ ...bridgeOptions,
-        getChats: () => cachedChats.filter((chat: any) => !separateGroups?.byMax(chat?.id)),
+        getChats: () => cachedChats.filter((chat: any) => !separateGroups?.byMax(chat?.id) && !dedicatedBots?.manages(chat?.id)),
       }));
       separateGroups.installInbox();
+      dedicatedBots.installInbox();
       chatSync.setRetryHandler(scheduleCatchUpRetry);
       watchPolling(bot);
       launchTelegramBotWithRetry(bot);
@@ -466,11 +481,11 @@ async function startServer(): Promise<void> {
   // and Telegram over long-polling, so nothing needs to listen on a port.
   let healthWriting = false;
   const healthInput = (): HealthInput => {
-    const primary = database?.health(); const separate = separateGroups?.health();
-    const oldest = [primary?.oldestAt, separate?.oldestAt].filter((n): n is number => n != null);
+    const primary = database?.health(); const separate = separateGroups?.health(); const dedicated = dedicatedBots?.health();
+    const oldest = [primary?.oldestAt, separate?.oldestAt, dedicated?.oldestAt].filter((n): n is number => n != null);
     return { startedAt, maxState: maxSession.state, telegramEnabled: config.telegramEnabled, telegramActive: tgActive, lastTelegramPollAt, paused: maxSession.state === 'paused',
-      queue: primary ? { pending: primary.pending + (separate?.pending ?? 0), failed: primary.failed + (separate?.failed ?? 0), uncertain: primary.uncertain + (separate?.uncertain ?? 0), oldestAt: oldest.length ? Math.min(...oldest) : null } : undefined,
-      incomingUncertain: (database?.values<{ created?: number }>('incomingPending').filter(p => typeof p.created === 'number' && Date.now() - p.created > 180_000).length ?? 0) + (separate?.incoming ?? 0) };
+      queue: primary ? { pending: primary.pending + (separate?.pending ?? 0) + (dedicated?.pending ?? 0), failed: primary.failed + (separate?.failed ?? 0) + (dedicated?.failed ?? 0), uncertain: primary.uncertain + (separate?.uncertain ?? 0) + (dedicated?.uncertain ?? 0), oldestAt: oldest.length ? Math.min(...oldest) : null } : undefined,
+      incomingUncertain: (database?.values<{ created?: number }>('incomingPending').filter(p => typeof p.created === 'number' && Date.now() - p.created > 180_000).length ?? 0) + (separate?.incoming ?? 0) + (dedicated?.incoming ?? 0) };
   };
   const healthServer = process.env.HEALTH_PORT ? serveBridgeHealth(healthInput, process.env.HEALTH_TOKEN ?? '', Number(process.env.HEALTH_PORT)) : undefined;
   healthServer?.on('error', () => { logger.error('Health endpoint could not listen'); process.exitCode = 1; });
@@ -501,6 +516,7 @@ async function startServer(): Promise<void> {
     maxSession.shutdown();
     deliveryQueue?.stop();
     void separateGroups?.stop();
+    void dedicatedBots?.stop();
     // Let in-flight work (a mid-write store persist, the polling loop's teardown)
     // drain naturally; the timer is the failsafe so a lingering keep-alive socket
     // or maintenance interval can't hold the process past docker's stop timeout.
@@ -548,6 +564,8 @@ function buildBotDescription(): string {
 // Populates Telegram's "/" command menu with one-line descriptions. /help (bridge/sync.ts)
 // has the full reference — these are just enough to jog the memory from the menu.
 const BOT_COMMANDS = [
+  { command: 'bot', description: 'Выделить контакт в отдельного бота с именем и фото MAX' },
+  { command: 'bots', description: 'Отдельные чаты MAX и создание новых' },
   { command: 'panel', description: '🎛 Пульт управления (меню с кнопками)' },
   { command: 'saved', description: '⭐ Открыть Избранное MAX' },
   { command: 'help', description: 'Полный список команд и ограничений' },
@@ -808,7 +826,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // broadcast's «📌» pin leaves in a channel, so it can be removed.
   const launchedAt = Date.now();
   bot
-    .launch({ allowedUpdates: ['message', 'edited_message', 'channel_post', 'message_reaction', 'poll_answer', 'callback_query', 'my_chat_member'] })
+    .launch({ allowedUpdates: ['message', 'edited_message', 'channel_post', 'message_reaction', 'poll_answer', 'callback_query', 'my_chat_member', 'managed_bot' as any] })
     .catch((err) => retryTelegramLaunch(bot, Date.now() - launchedAt >= TELEGRAM_STABLE_POLLING_MS ? 0 : attempt, err));
 }
 

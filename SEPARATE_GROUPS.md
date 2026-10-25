@@ -31,17 +31,15 @@ again. Membership service events block delivery immediately when received; the b
 revalidates Telegram membership every thirty seconds. There is no atomic Telegram API guard
 against a membership change racing an in-flight send.
 
-## Read receipts in both modes
+## Read status
 
-Read cards initialize from MAX's existing chat read boundaries, including for older linked
-outgoing messages; a new push event is not required. Cards show the latest linked outgoing
-message and confirmed reading. `/receipt` as a reply checks a specific linked message against
-fresh MAX data. Missing confirmation is reported as unknown, not proof that the message is unread.
+Automatic read cards are removed at the owner's request. Startup deletes only recorded card
+message IDs, leaving conversation history and message links intact. `/receipt` is an explicit
+on-demand query; the bridge emits no automatic read cards or per-read notifications.
 
-Reading is distinct from playing audio/video. The inspected MAX protocol has no independent
-playback receipt. The ordinary Telegram Bot API cannot change the native voice playback dot or
-make its own Telegram read ticks represent a remote MAX recipient. Receipt cards are edited in
-place; editing a card does not send a new Telegram push notification for every read event.
+A dedicated bot and DM per contact is available through `/bot` or `/bots`; see
+[DEDICATED_BOTS.md](DEDICATED_BOTS.md). Normal bot accounts cannot control native Telegram read
+or voice-playback ticks, including via MTProto. These APIs require an ordinary user account.
 
 Back up the entire `.data` tree and the encrypted-session key together. Child SQLite databases
 must be included in the same consistent exports and restore checks as the primary database.

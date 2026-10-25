@@ -13,7 +13,7 @@ import { createLogger } from '../logger.js';
 
 const logger = createLogger('separate-groups');
 interface Request { code: string; maxChatId: string; title: string; topicId: number; created: number }
-export interface SeparateGroup extends Request { telegramChatId: string; state: 'preparing' | 'active' | 'blocked'; reason?: string; avatarKey?: string; cursor?: string }
+export interface SeparateGroup extends Request { telegramChatId: string; state: 'preparing' | 'active' | 'blocked' | 'dedicated'; reason?: string; avatarKey?: string; cursor?: string }
 interface Runtime { bot: Telegraf; bridge: WiredBridge; db: BridgeDatabase; available: boolean; detach(): void }
 const actor = (u: any): number | undefined => u.message?.from?.id ?? u.edited_message?.from?.id ?? u.callback_query?.from?.id ?? u.message_reaction?.user?.id ?? u.poll_answer?.user?.id ?? u.my_chat_member?.from?.id;
 const chat = (u: any): string => String(u.message?.chat?.id ?? u.edited_message?.chat?.id ?? u.callback_query?.message?.chat?.id ?? u.message_reaction?.chat?.id ?? u.my_chat_member?.chat?.id);
@@ -34,6 +34,7 @@ export class SeparateGroups {
       const group = this.forUpdate(ctx.update);
       if (group) {
         if (actor(ctx.update) !== options.ownerUserId) return;
+        if (group.state === 'dedicated') { await ctx.reply('Новая переписка перенесена в отдельного бота. Список: /bots в основной группе. Здесь сохранена прежняя история.'); return; }
         const runtime = this.runtimes.get(group.maxChatId);
         if (!runtime || !runtime.available) { await ctx.reply('Пересылка остановлена. В группе должны быть только владелец и бот с правами администратора.'); return; }
         await runtime.bot.handleUpdate(standaloneUpdate(ctx.update)); return;
@@ -48,6 +49,7 @@ export class SeparateGroups {
       const topicId = ctx.message.message_thread_id;
       const mapping = topicId ? await options.chatMapStore.getByTopicId(topicId) : undefined;
       if (!mapping || mapping.pendingUserId) { await ctx.reply('Отправьте /separate внутри темы нужного MAX-чата.'); return; }
+      if (mapping.dedicatedBotId) { await ctx.reply('Чат уже выделен в отдельного бота. Список: /bots'); return; }
       const bound = this.byMax(mapping.maxChatId);
       if (bound) { await ctx.reply('Этот чат уже привязан к отдельной группе. Список: /groups'); return; }
       const request: Request = { code: randomBytes(16).toString('hex'), maxChatId: mapping.maxChatId, title: mapping.title ?? 'Чат MAX', topicId: topicId!, created: Date.now() };
@@ -67,6 +69,22 @@ export class SeparateGroups {
   private get db(): BridgeDatabase { return this.options.database!; }
   records(): SeparateGroup[] { return this.db.values<SeparateGroup>('separateGroups'); }
   byMax(id: unknown): SeparateGroup | undefined { return this.db.get('separateGroups', String(id)); }
+  byTelegram(id: string): SeparateGroup | undefined { return this.forTelegram(id); }
+  async retireForBot(chatId: string): Promise<string | undefined> {
+    const record = this.byMax(chatId); if (!record) return undefined;
+    if (record.state === 'dedicated') return record.cursor;
+    const runtime = this.runtimes.get(chatId);
+    if (!runtime) throw new Error('Previous group is unavailable; binding remains pending');
+    await runtime.bridge.deliveryQueue?.drain();
+    if (runtime.db.pending(1).length || runtime.db.values('incomingPending').length) throw new Error('Previous group has unresolved deliveries');
+    runtime.available = false;
+    await runtime.bridge.stop(); runtime.detach();
+    const stateDirectory = path.dirname(runtime.db.file);
+    const map = new ChatMapStore(path.join(stateDirectory, 'chat-map.json'));
+    const cursor = (await map.getByMaxChatId(chatId))?.historyBackfillCursor;
+    this.db.set('separateGroups', chatId, { ...record, state: 'dedicated', cursor });
+    return cursor;
+  }
   private forTelegram(id: string): SeparateGroup | undefined { return this.records().find(r => r.telegramChatId === id); }
   private forUpdate(update: Update): SeparateGroup | undefined {
     const pollId = (update as any).poll_answer?.poll_id;
@@ -91,7 +109,7 @@ export class SeparateGroups {
     });
   }
   async start(): Promise<void> {
-    for (const record of this.records()) await this.open(record);
+    for (const record of this.records()) if (record.state !== 'dedicated') await this.open(record);
     await this.tick();
     this.timer = setInterval(() => void this.tick().catch(() => logger.warn('Separate-group maintenance remains pending')), 30_000); this.timer.unref();
   }
@@ -116,6 +134,7 @@ export class SeparateGroups {
       }
     }
     for (const record of this.records()) {
+      if (record.state === 'dedicated') continue;
       const original = await this.options.chatMapStore.getByMaxChatId(record.maxChatId);
       if (original && original.separateTelegramChatId !== record.telegramChatId) {
         await this.options.chatMapStore.upsert({ ...original, separateTelegramChatId: record.telegramChatId });
@@ -169,7 +188,7 @@ export class SeparateGroups {
     if (!this.db.get('separateNotices', key)) {
       this.db.set('separateNotices', key, true); // An uncertain Telegram ACK must not duplicate setup cards.
       const old = this.options.targetGroupId.startsWith('-100') ? `https://t.me/c/${this.options.targetGroupId.slice(4)}/${record.topicId}` : '';
-      await this.options.bot.telegram.sendMessage(destination, `Чат MAX подключён. Пишите прямо в эту группу.\n${old ? `Прежняя история: ${old}\n` : ''}/receipt ответом на сообщение — подтверждённое прочтение в MAX. Прослушивание отдельно не подтверждается доступным протоколом.`, { disable_notification: true });
+      await this.options.bot.telegram.sendMessage(destination, `Чат MAX подключён. Пишите прямо в эту группу.\n${old ? `Прежняя история: ${old}\n` : ''}`, { disable_notification: true });
     }
   }
   private async open(record: SeparateGroup): Promise<void> {
@@ -225,7 +244,7 @@ export class SeparateGroups {
   health(): { pending: number; failed: number; uncertain: number; oldestAt: number | null; incoming: number } {
     const all = [...this.runtimes.values()]; const states = all.map(r => r.db.health());
     const ages = states.flatMap(s => s.oldestAt == null ? [] : [s.oldestAt]);
-    return { pending: states.reduce((n, s) => n + s.pending, 0), failed: states.reduce((n, s) => n + s.failed, 0) + this.records().filter(r => r.state !== 'active').length,
+    return { pending: states.reduce((n, s) => n + s.pending, 0), failed: states.reduce((n, s) => n + s.failed, 0) + this.records().filter(r => r.state !== 'active' && r.state !== 'dedicated').length,
       uncertain: states.reduce((n, s) => n + s.uncertain, 0), oldestAt: ages.length ? Math.min(...ages) : null, incoming: all.reduce((n, r) => n + r.db.values('incomingPending').length, 0) };
   }
   async stop(): Promise<void> {

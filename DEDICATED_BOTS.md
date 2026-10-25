@@ -76,3 +76,7 @@ Voice/video-note privacy belongs to the Telegram owner, independently for each n
 `getChat.has_restricted_voice_and_video_messages` is true, allow that particular bot in Telegram
 Settings → Privacy → Voice Messages → Always Allow. The owner declined a file-delivery fallback.
 Private dedicated history uses 1.1-second pacing; ordinary groups retain their 20/minute pacing.
+
+Identity updates skip `setMyName` when `getMe` already reports the correct name. A name-change
+rate limit persists Telegram's retry-after deadline across restarts and does not block profile
+photo updates. This prevents repeated unchanged-name calls from starving avatar synchronization.

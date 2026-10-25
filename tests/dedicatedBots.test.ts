@@ -36,11 +36,15 @@ const msg = (id: number, text: string, owner = 42, destination = -10055) => ({ u
   message_thread_id: 7, text, ...(text.startsWith('/') ? { entities: [{ type: 'bot_command', offset: 0, length: text.split(' ')[0]!.length }] } : {}) } }) as any;
 
 async function setup() {
-  let inbox: any[] = [], counter = 1000, managerEnabled = true;
+  let inbox: any[] = [], counter = 1000, managerEnabled = true, childName = 'Root', nameBlocked = false;
   const calls: Array<{ id: number; method: string; payload: any }> = [];
   vi.spyOn(Telegram.prototype, 'callApi').mockImplementation((async function (this: any, method: string, payload: any) {
     const child = this.token === token, id = child ? 456 : 123; calls.push({ id, method, payload });
-    if (method === 'getMe') return child ? { ...info, id: 456, username: 'contact_bot' } : { ...info, can_manage_bots: managerEnabled };
+    if (method === 'getMe') return child ? { ...info, id: 456, username: 'contact_bot', first_name: childName } : { ...info, can_manage_bots: managerEnabled };
+    if (method === 'setMyName') {
+      if (nameBlocked) throw { response: { error_code: 429, parameters: { retry_after: 86400 } } };
+      childName = payload.name; return true;
+    }
     if (method === 'getWebhookInfo') return { url: '' };
     if (method === 'getManagedBotToken') return token;
     if (method === 'getUpdates') return inbox;
@@ -78,6 +82,7 @@ async function setup() {
   const runtime = () => (manager as any).runtimes.get('55') as any;
   return { get bot() { return bot; }, max, map, settings, calls, request, candidate, bind, runtime, previousChat,
     inbox: (u: any[]) => { inbox = u; }, enable: (v: boolean) => { managerEnabled = v; },
+    blockName: () => { nameBlocked = true; },
     restart: async () => { await manager!.stop(); manager!.closeDatabases(); bot = new Telegraf('123:ROOT_FAKE_TOKEN'); bot.botInfo = info; manager = make(); await manager.start(); } };
 }
 
@@ -152,6 +157,16 @@ describe('dedicated MAX bot provisioning', () => {
     await h.runtime().poll.batch([standaloneUpdate(msg(55, '/start bridge', 42, 42))]); await manager!.tick();
     expect(vi.mocked(maxFetch)).toHaveBeenCalledWith('https://example.invalid/square.jpg', expect.any(Object));
     expect(h.calls.some(c => c.method === 'setMyProfilePhoto')).toBe(true);
+    const changes = h.calls.filter(c => c.method === 'setMyName').length;
+    await h.restart(); expect(h.calls.filter(c => c.method === 'setMyName')).toHaveLength(changes);
+  });
+  it('updates the avatar even when Telegram rate-limits name changes and preserves its cooldown', async () => {
+    const h = await setup(); await h.request(); await h.candidate(); await h.bind(); h.blockName();
+    (h.max as any).isLoggedIn = true;
+    await h.runtime().poll.batch([standaloneUpdate(msg(56, '/start bridge', 42, 42))]); await manager!.tick();
+    expect(h.calls.some(c => c.method === 'setMyProfilePhoto')).toBe(true);
+    expect(db.get<number>('dedicatedIdentity', 'nameRetry:456')).toBeGreaterThan(Date.now());
+    await h.restart(); expect(h.calls.filter(c => c.method === 'setMyName')).toHaveLength(1);
   });
   it('repairs a legacy destination once and preserves local aliases and later progress', async () => {
     const h = await setup(); await h.request(); await h.candidate(); await h.bind();

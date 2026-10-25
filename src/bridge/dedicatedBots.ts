@@ -272,7 +272,19 @@ export class DedicatedBots {
     if (profile && ids[0] != null) this.options.getContactProfiles().set(ids[0], profile);
     const title = resolveChatName(raw, this.options.getMyAccountId(), this.options.getContactProfiles());
     const name = standaloneTitle(title).slice(0, 64);
-    await api(runtime.bot, 'setMyName', { name });
+    const retryKey = `nameRetry:${record.botId}`;
+    if (runtime.bot.botInfo?.first_name !== name && Date.now() >= (this.db.get<number>('dedicatedIdentity', retryKey) ?? 0)) {
+      try {
+        await api(runtime.bot, 'setMyName', { name });
+        runtime.bot.botInfo = { ...runtime.bot.botInfo!, first_name: name };
+        this.db.delete('dedicatedIdentity', retryKey);
+      } catch (error) {
+        const retry = Number((error as any)?.response?.parameters?.retry_after);
+        this.db.set('dedicatedIdentity', retryKey, Date.now() + (Number.isFinite(retry) && retry > 0 ? retry * 1000 : 15 * 60_000));
+        // Telegram limits name changes separately. A name cooldown must never block the avatar.
+        logger.warn('Dedicated bot name update deferred');
+      }
+    }
     const photo = (profile ?? raw) as { baseRawUrl?: string; baseUrl?: string; photoId?: unknown };
     // MAX's square baseUrl is JPEG; baseRawUrl can be the original WebP/portrait image.
     const url = photo.baseUrl ?? photo.baseRawUrl, avatarKey = url ? createHash('sha256').update(String(photo.photoId ?? url)).digest('hex') : undefined;

@@ -274,7 +274,8 @@ export class DedicatedBots {
     const name = standaloneTitle(title).slice(0, 64);
     await api(runtime.bot, 'setMyName', { name });
     const photo = (profile ?? raw) as { baseRawUrl?: string; baseUrl?: string; photoId?: unknown };
-    const url = photo.baseRawUrl ?? photo.baseUrl, avatarKey = url ? createHash('sha256').update(String(photo.photoId ?? url)).digest('hex') : undefined;
+    // MAX's square baseUrl is JPEG; baseRawUrl can be the original WebP/portrait image.
+    const url = photo.baseUrl ?? photo.baseRawUrl, avatarKey = url ? createHash('sha256').update(String(photo.photoId ?? url)).digest('hex') : undefined;
     if (url && avatarKey !== record.avatarKey && new URL(url).protocol === 'https:') {
       const response = await maxFetch(url, { signal: AbortSignal.timeout(15_000) });
       if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 10 * 1024 * 1024) throw new Error('Avatar unavailable');

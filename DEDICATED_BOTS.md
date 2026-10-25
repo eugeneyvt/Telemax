@@ -26,7 +26,7 @@ already saved jobs deduplicate on replay. Stalled requests abort after ninety se
 updates stop the old child poller before opening the replacement. Existing webhooks are refused
 instead of taken over. Non-owner messages and other Telegram groups cannot reach MAX.
 
-The new bot adopts the MAX contact label and available profile photo. Identity is refreshed every
+The new bot adopts the MAX contact label and available profile photo. It prefers MAX's square JPEG preview (`baseUrl`); the original (`baseRawUrl`) may be WebP, which is not accepted as a static bot profile photo. Identity is refreshed every
 fifteen minutes. Messages are authored by this dedicated bot, so its identity appears throughout
 the private conversation. Telegram usernames still have to be unique and end in `bot`. Creation
 is subject to the account's Telegram bot limit. MAX groups can also be selected, but one bot then
@@ -71,3 +71,8 @@ Sources: [managed bots](https://core.telegram.org/api/bots/managed-bots),
 [profile photo](https://core.telegram.org/bots/api#setmyprofilephoto),
 [readHistory](https://core.telegram.org/method/messages.readHistory),
 [readBusinessMessage](https://core.telegram.org/bots/api#readbusinessmessage).
+
+Voice/video-note privacy belongs to the Telegram owner, independently for each new bot DM. If
+`getChat.has_restricted_voice_and_video_messages` is true, allow that particular bot in Telegram
+Settings → Privacy → Voice Messages → Always Allow. The owner declined a file-delivery fallback.
+Private dedicated history uses 1.1-second pacing; ordinary groups retain their 20/minute pacing.

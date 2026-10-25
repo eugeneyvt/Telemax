@@ -232,7 +232,7 @@ export class SeparateGroups {
       this.db.set('separateIdentity', nameKey, title); this.db.set('separateGroups', record.maxChatId, { ...current, title });
     }
     const photo = (profile ?? raw) as { baseRawUrl?: string; baseUrl?: string; photoId?: unknown };
-    const url = photo.baseRawUrl ?? photo.baseUrl;
+    const url = photo.baseUrl ?? photo.baseRawUrl;
     const avatarKey = url && createHash('sha256').update(String(photo.photoId ?? url)).digest('hex');
     if (url && avatarKey !== this.byMax(record.maxChatId)?.avatarKey && new URL(url).protocol === 'https:') {
       const response = await maxFetch(url, { signal: AbortSignal.timeout(15000) });

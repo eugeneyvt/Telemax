@@ -16,6 +16,7 @@ import { removeReceiptCards } from '../src/bridge/receiptCleanup.js';
 import { DIR, OPCODES } from '../src/max/opcodes.js';
 import { SettingsStore } from '../src/store/settingsStore.js';
 import { initializeStandaloneHistory } from '../src/bridge/standaloneHistory.js';
+import { maxFetch } from '../src/max/ca.js';
 
 vi.mock('../src/max/ca.js', async original => ({ ...await original<object>(), maxFetch: vi.fn(async () => new Response(new Uint8Array([1, 2, 3]))) }));
 let directory: string, db: BridgeDatabase, manager: DedicatedBots | undefined;
@@ -144,6 +145,14 @@ describe('dedicated MAX bot provisioning', () => {
     await h.restart();
     expect(h.calls.filter(c => c.id === 456 && c.method === 'sendMessage' && c.payload.text?.includes('older missing history'))).toHaveLength(1);
   }, 15000);
+  it('selects the MAX JPEG avatar instead of its original WebP image', async () => {
+    const h = await setup(); await h.request(); await h.candidate(); await h.bind();
+    vi.mocked(h.max.getContactInfo).mockResolvedValue([{ id: 2, names: [{ type: 'CUSTOM', name: 'Метка контакта' }], baseUrl: 'https://example.invalid/square.jpg', baseRawUrl: 'https://example.invalid/original.webp', photoId: 33 }]);
+    (h.max as any).isLoggedIn = true;
+    await h.runtime().poll.batch([standaloneUpdate(msg(55, '/start bridge', 42, 42))]); await manager!.tick();
+    expect(vi.mocked(maxFetch)).toHaveBeenCalledWith('https://example.invalid/square.jpg', expect.any(Object));
+    expect(h.calls.some(c => c.method === 'setMyProfilePhoto')).toBe(true);
+  });
   it('repairs a legacy destination once and preserves local aliases and later progress', async () => {
     const h = await setup(); await h.request(); await h.candidate(); await h.bind();
     const r = h.runtime(); r.db.delete('standaloneHistory', 'destination-v1');

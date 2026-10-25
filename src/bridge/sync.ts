@@ -2061,6 +2061,8 @@ export function wireBridge({
     isWiping: () => wiping,
     onRelayed: (c) => broadcasts.copyIncoming(c),
     historyLimit: historyLimitFromEnv(),
+    // Telegram's private-chat limit is one message/second; groups retain the 20/minute pacing.
+    ...(standalone && privateMode ? { paceMs: 1100 } : {}),
     ...(database ? { checkpointIncoming } : {}),
     isPendingOutgoing: msg => String(msg.sender) === String(getMyAccountId()) && Boolean(database?.hasPendingCid(msg.cid)),
     pollWidgets,

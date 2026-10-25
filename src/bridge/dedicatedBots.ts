@@ -27,7 +27,11 @@ interface Dependencies {
   polling?: boolean;
 }
 const actor = (u: any) => u.message?.from?.id ?? u.edited_message?.from?.id ?? u.callback_query?.from?.id ?? u.message_reaction?.user?.id ?? u.poll_answer?.user?.id ?? u.managed_bot?.user?.id;
-const api = (bot: Telegraf, method: string, payload: unknown = {}): Promise<any> => (bot.telegram.callApi as Function).call(bot.telegram, method, payload);
+async function api(bot: Telegraf, method: string, payload: unknown = {}): Promise<any> {
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 20_000);
+  try { return await (bot.telegram.callApi as Function).call(bot.telegram, method, payload, { signal: controller.signal }); }
+  finally { clearTimeout(timer); }
+}
 const expired = (r: Request) => Date.now() - r.created > 7 * 86_400_000;
 
 /** One encrypted token, DM, durable queue and poll offset for each explicitly selected MAX chat. */
@@ -43,8 +47,12 @@ export class DedicatedBots {
       const u = ctx.update as any;
       const ownedEvent = u.managed_bot || u.message?.managed_bot_created || /^tlmx_bot_/.test(u.callback_query?.data ?? '');
       if (ownedEvent) {
-        if (actor(u) === options.ownerUserId) { this.acceptManagement(ctx.update); await this.tick(); }
-        if (u.callback_query && actor(u) === options.ownerUserId) await ctx.answerCbQuery().catch(() => {});
+        if (actor(u) === options.ownerUserId) {
+          this.acceptManagement(ctx.update);
+          // Acknowledge before external provisioning, which may have to wait for Telegram.
+          if (u.callback_query) await api(options.bot, 'answerCallbackQuery', { callback_query_id: u.callback_query.id, text: /^tlmx_bot_bind:/.test(u.callback_query.data ?? '') ? 'Подключаю…' : undefined }).catch(() => {});
+          await this.tick();
+        }
         return;
       }
       const code = /^\/start(?:@\w+)?\s+dedicate_([a-f0-9]{24})$/.exec(u.message?.text ?? '')?.[1];
@@ -85,7 +93,7 @@ export class DedicatedBots {
   }
   private async creationPrompt(code: string): Promise<void> {
     const r = this.db.get<Request>('dedicatedRequests', code); if (!r || expired(r)) return;
-    const me = await this.options.bot.telegram.getMe(); this.options.bot.botInfo = me;
+    const me = await api(this.options.bot, 'getMe'); this.options.bot.botInfo = me;
     if (!(me as any).can_manage_bots) {
       await this.tell('Включите управление другими ботами у @BotFather для основного бота, затем повторите /bot в теме контакта.'); return;
     }
@@ -121,7 +129,17 @@ export class DedicatedBots {
         if (event.kind === 'candidate') await this.candidate(event);
         else await this.button(event.data);
         this.db.delete('dedicatedManagementInbox', String(event.updateId));
-      } catch { logger.warn('Dedicated bot management action remains saved'); }
+      } catch {
+        logger.warn('Dedicated bot management action remains saved');
+        const bind = /^tlmx_bot_bind:([a-f0-9]{24}):(\d+)$/.exec(event.data ?? '');
+        const candidate = bind && this.db.get<Candidate>('dedicatedCandidates', bind[2]!);
+        const key = `pending:${event.data}`;
+        if (candidate && !this.db.get('dedicatedNotices', key)) {
+          await this.tell('Telegram пока не завершил подключение нового бота. Запрос сохранён, повторю автоматически. Можно уже открыть его и нажать Start.', {
+            inline_keyboard: [[{ text: 'Открыть нового бота', url: `https://t.me/${candidate.username}?start=bridge` }]],
+          }).then(() => this.db.set('dedicatedNotices', key, true)).catch(() => {});
+        }
+      }
     }
     for (const record of this.records()) {
       try {
@@ -148,10 +166,10 @@ export class DedicatedBots {
     const choices = matched.length ? matched : pending;
     const key = `candidate:${c.botId}`;
     if (this.db.get('dedicatedNotices', key)) return;
-    this.db.set('dedicatedNotices', key, true);
     await this.tell(`Бот @${c.username} создан. Подтвердите, какой MAX-чат к нему подключить. Новая переписка перенесётся после нажатия Start в его личке.`, {
       inline_keyboard: choices.slice(0, 20).map(r => [{ text: `Подключить «${r.title.slice(0, 40)}»`, callback_data: `tlmx_bot_bind:${r.code}:${c.botId}` }]),
     });
+    this.db.set('dedicatedNotices', key, true);
   }
   private async button(data: string): Promise<void> {
     const page = /^tlmx_bot_pick:(\d+)$/.exec(data);
@@ -185,12 +203,12 @@ export class DedicatedBots {
   }
   private async boundNotice(record: DedicatedBot): Promise<void> {
     if (this.db.get('dedicatedNotices', `bound:${record.botId}`)) return;
-    this.db.set('dedicatedNotices', `bound:${record.botId}`, true);
     await this.tell(`«${record.title}» привязан к @${record.username}. Откройте его и нажмите Start.`, { inline_keyboard: [[{ text: 'Открыть отдельный чат', url: `https://t.me/${record.username}?start=bridge` }]] });
+    this.db.set('dedicatedNotices', `bound:${record.botId}`, true);
   }
   private async storeToken(record: DedicatedBot, newBinding = false): Promise<void> {
     const token = await api(this.options.bot, 'getManagedBotToken', { user_id: record.botId });
-    const bot = this.deps.createBot(token), me = await bot.telegram.getMe();
+    const bot = this.deps.createBot(token), me = await api(bot, 'getMe');
     if (me.id !== record.botId || !me.is_bot || me.id === this.options.bot.botInfo?.id) throw new Error('Managed bot identity mismatch');
     await api(this.options.bot, 'setManagedBotAccessSettings', { user_id: record.botId, is_access_restricted: true, added_user_ids: [] });
     const sealed = sealDedicatedToken(token, record.botId, record.maxChatId);
@@ -202,9 +220,9 @@ export class DedicatedBots {
   private async open(record: DedicatedBot): Promise<void> {
     const sealed = this.db.get<ReturnType<typeof sealDedicatedToken>>('dedicatedTokens', String(record.botId)); if (!sealed) throw new Error('Managed token missing');
     const bot = this.deps.createBot(openDedicatedToken(sealed, record.botId, record.maxChatId));
-    bot.botInfo = await bot.telegram.getMe(); if (bot.botInfo.id !== record.botId) throw new Error('Managed identity mismatch');
+    bot.botInfo = await api(bot, 'getMe'); if (bot.botInfo?.id !== record.botId) throw new Error('Managed identity mismatch');
     // Refuse to take over an existing webhook. Newly created bots have no webhook.
-    const hook = await bot.telegram.getWebhookInfo(); if (hook.url) throw new Error('Managed bot has an existing webhook');
+    const hook = await api(bot, 'getWebhookInfo'); if (hook.url) throw new Error('Managed bot has an existing webhook');
     const directory = path.join(process.cwd(), '.data', 'dedicated-bots', String(record.botId));
     const db = new BridgeDatabase(path.join(directory, 'bridge.sqlite'), () => this.db.nextCid());
     const map = new ChatMapStore(path.join(directory, 'chat-map.json'));

@@ -36,10 +36,12 @@ const msg = (id: number, text: string, owner = 42, destination = -10055) => ({ u
   message_thread_id: 7, text, ...(text.startsWith('/') ? { entities: [{ type: 'bot_command', offset: 0, length: text.split(' ')[0]!.length }] } : {}) } }) as any;
 
 async function setup() {
-  let inbox: any[] = [], counter = 1000, managerEnabled = true, childName = 'Root', nameBlocked = false;
-  const calls: Array<{ id: number; method: string; payload: any }> = [];
-  vi.spyOn(Telegram.prototype, 'callApi').mockImplementation((async function (this: any, method: string, payload: any) {
-    const child = this.token === token, id = child ? 456 : 123; calls.push({ id, method, payload });
+  let inbox: any[] = [], counter = 1000, managerEnabled = true, childName = 'Root', nameBlocked = false, identityUnavailable = false, sendUnavailable = false;
+  const calls: Array<{ id: number; method: string; payload: any; signal?: AbortSignal }> = [];
+  vi.spyOn(Telegram.prototype, 'callApi').mockImplementation((async function (this: any, method: string, payload: any, extra?: { signal?: AbortSignal }) {
+    const child = this.token === token, id = child ? 456 : 123; calls.push({ id, method, payload, signal: extra?.signal });
+    if (method === 'getMe' && child && identityUnavailable) throw { response: { error_code: 504, description: 'Gateway Time-out' } };
+    if (method === 'sendMessage' && sendUnavailable) throw { response: { error_code: 503 } };
     if (method === 'getMe') return child ? { ...info, id: 456, username: 'contact_bot', first_name: childName } : { ...info, can_manage_bots: managerEnabled };
     if (method === 'setMyName') {
       if (nameBlocked) throw { response: { error_code: 429, parameters: { retry_after: 86400 } } };
@@ -83,10 +85,32 @@ async function setup() {
   return { get bot() { return bot; }, max, map, settings, calls, request, candidate, bind, runtime, previousChat,
     inbox: (u: any[]) => { inbox = u; }, enable: (v: boolean) => { managerEnabled = v; },
     blockName: () => { nameBlocked = true; },
+    identityFailure: (value: boolean) => { identityUnavailable = value; },
+    sendFailure: (value: boolean) => { sendUnavailable = value; },
     restart: async () => { await manager!.stop(); manager!.closeDatabases(); bot = new Telegraf('123:ROOT_FAKE_TOKEN'); bot.botInfo = info; manager = make(); await manager.start(); } };
 }
 
 describe('dedicated MAX bot provisioning', () => {
+  it('acknowledges binding immediately and retries a Telegram 504 without another click', async () => {
+    const h = await setup(); const r = await h.request(); await h.candidate(); h.identityFailure(true);
+    await h.bot.handleUpdate({ update_id: 777, callback_query: { id: 'bind-query', from: { id: 42, is_bot: false, first_name: 'Owner' }, data: `tlmx_bot_bind:${r.code}:456` } } as any);
+    const ack = h.calls.findIndex(c => c.method === 'answerCallbackQuery');
+    expect(ack).toBeGreaterThan(-1); expect(ack).toBeLessThan(h.calls.findIndex(c => c.method === 'getManagedBotToken'));
+    expect(h.calls.find(c => c.method === 'getMe' && c.id === 456)?.signal).toBeInstanceOf(AbortSignal);
+    expect(db.values('dedicatedManagementInbox')).toHaveLength(1); expect(manager!.records()).toHaveLength(0);
+    expect(h.calls.filter(c => c.payload?.text?.includes('Запрос сохранён'))).toHaveLength(1);
+    await manager!.tick(); expect(h.calls.filter(c => c.payload?.text?.includes('Запрос сохранён'))).toHaveLength(1);
+    h.identityFailure(false); await manager!.tick();
+    expect(manager!.records()).toHaveLength(1); expect(db.values('dedicatedManagementInbox')).toHaveLength(0);
+  });
+  it('retries a creation notice whose delivery was rejected by Telegram', async () => {
+    const h = await setup(); await h.request(); h.sendFailure(true); await h.candidate();
+    expect(db.get('dedicatedNotices', 'candidate:456')).toBeUndefined();
+    h.sendFailure(false); await manager!.tick();
+    expect(db.get('dedicatedNotices', 'candidate:456')).toBe(true);
+    expect(h.calls.some(c => c.payload?.text?.includes('Бот @'))).toBe(true);
+  });
+
   it('offers an owner-confirmed Telegram creation button with a unique username', async () => {
     const h = await setup(); const r = await h.request();
     const prompt = h.calls.find(c => c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.url?.includes('/newbot/'));

@@ -88,8 +88,10 @@ export class DedicatedBots {
     if (!(me as any).can_manage_bots) {
       await this.tell('Включите управление другими ботами у @BotFather для основного бота, затем повторите /bot в теме контакта.'); return;
     }
-    await this.tell(`Создать отдельную личку «${standaloneTitle(r.title)}»? Telegram попросит подтвердить имя и username. После создания я предложу привязку к этому MAX-чату.`, {
-      inline_keyboard: [[{ text: `Создать «${standaloneTitle(r.title).slice(0, 44)}»`, url: `https://t.me/newbot/${me.username}/${r.username}?name=${encodeURIComponent(standaloneTitle(r.title).slice(0, 64))}` }]],
+    const name = standaloneTitle(r.title).slice(0, 64);
+    await this.tell(`Создать отдельную личку «${name}»? Telegram попросит подтвердить имя и username. Если поле Bot Name пустое, сначала нажмите «Скопировать имя», затем вставьте его в форму. После создания я предложу привязку к этому MAX-чату.`, {
+      inline_keyboard: [[{ text: `Создать «${name.slice(0, 44)}»`, url: `https://t.me/newbot/${me.username}/${r.username}?name=${encodeURIComponent(name)}` }],
+        [{ text: 'Скопировать имя', copy_text: { text: name } }]],
     });
   }
   private tell(text: string, reply_markup?: unknown): Promise<any> {
